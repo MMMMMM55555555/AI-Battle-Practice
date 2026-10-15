@@ -4,3 +4,5 @@ pandas
 PyPDF2
 openpyxl
 Pillow
+plotly
+numpy
