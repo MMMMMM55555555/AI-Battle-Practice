@@ -824,7 +824,7 @@ if 'extracted_params' in st.session_state:
     c5.metric("ขนาดท่อหลัก (Pipe Diameter)", format_metric(raw_data.get('main_pipe_diameter_m'), "m"))
     c6.metric("วัสดุ/ความขรุขระ (Roughness)", format_metric(raw_data.get('pipe_material_or_roughness'), ""))
 
-   with st.expander("🔧 ดูรายการอุปกรณ์ประกอบ (Minor Loss Fittings) และสเปคมอเตอร์", expanded=False):
+    with st.expander("🔧 ดูรายการอุปกรณ์ประกอบ (Minor Loss Fittings) และสเปคมอเตอร์", expanded=False):
         st.write(f"**ลักษณะระบบ:** {format_metric(raw_data.get('system_type'), '')} | **จำนวนปั๊มเดินขนาน:** {format_metric(raw_data.get('num_parallel_pumps'), 'เครื่อง', 0)} | **ขนาดมอเตอร์ที่เสนอ:** {format_metric(raw_data.get('proposed_motor_kw'), 'kW', 0)}")
         
         fittings = raw_data.get('minor_loss_fittings') or []
