@@ -18,7 +18,7 @@ st.caption("จาก Input Parameters → คำนวณ Head Loss & System Cu
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # ==========================================
-# 1. ฟังก์ชันช่วยเหลือ & แปลชื่อตัวแปรเป็นภาษาไทย (HELPERS & TRANSLATOR)
+# 1. ฟังก์ชันช่วยเหลือ & แปลชื่อตัวแปรเป็นภาษาไทย
 # ==========================================
 FIELD_THAI_MAP = {
     "flow_rate_q_m3s": "อัตราการไหลที่ต้องการ (Flow Rate Q)",
@@ -26,26 +26,13 @@ FIELD_THAI_MAP = {
     "main_pipe_length_m": "ความยาวรวมของท่อหรืออุโมงค์ (Pipe/Tunnel Length)",
     "main_pipe_diameter_m": "ขนาดเส้นผ่านศูนย์กลางท่อหรืออุโมงค์ (Pipe Diameter)",
     "pipe_material_or_roughness": "ชนิดวัสดุท่อ หรือค่าความขรุขระ (Manning's n / Friction Factor f)",
-    "manning_n": "ค่าสัมประสิทธิ์ความขรุขระ Manning's n",
-    "darcy_f": "ค่าสัมประสิทธิ์ความเสียดทาน Darcy Friction Factor (f)",
-    "minor_loss_fittings": "รายการอุปกรณ์ประกอบในระบบท่อ (Minor Loss Fittings)",
-    "proposed_pump_head_m": "เฮดของเครื่องสูบน้ำที่ผู้รับจ้างเสนอ (Proposed Pump Duty Head)",
-    "proposed_pump_shutoff_head_m": "เฮดสูงสุดที่อัตราการไหลเป็นศูนย์ (Pump Shutoff Head)",
+    "proposed_pump_head_m": "เฮดของเครื่องสูบน้ำที่เสนอ (Proposed Pump Head หรือพิกัดกราฟปั๊ม)",
     "proposed_pump_eff_pct": "ประสิทธิภาพเครื่องสูบน้ำ (Pump Efficiency %)",
     "proposed_gear_eff_pct": "ประสิทธิภาพชุดเกียร์ทดรอบ (Gearbox Efficiency %)",
     "proposed_motor_kw": "ขนาดกำลังมอเตอร์ไฟฟ้าที่เสนอ (Proposed Motor Power kW)",
     "proposed_npshr_m": "ค่า NPSHr ของเครื่องสูบน้ำ (Net Positive Suction Head Required)"
 }
 
-def translate_field_name(raw_name):
-    """แปลงชื่อตัวแปรภาษาอังกฤษที่ AI อาจส่งติดมา ให้เป็นภาษาไทยที่สวยงาม"""
-    clean_key = str(raw_name).strip()
-    if clean_key in FIELD_THAI_MAP:
-        return FIELD_THAI_MAP[clean_key]
-    for eng_k, th_v in FIELD_THAI_MAP.items():
-        if eng_k in clean_key.lower():
-            return th_v
-    return clean_key
 
 def format_metric(val, unit="", decimals=2):
     """แสดงหน่วยวัดเฉพาะเมื่อมีตัวเลขจริงเท่านั้น หากไม่มีข้อมูลจะแสดง 'ไม่พบข้อมูล' ล้วนๆ"""
@@ -63,13 +50,63 @@ def format_metric(val, unit="", decimals=2):
     except (ValueError, TypeError):
         return f"{val} {unit}".strip() if unit else str(val)
 
-def check_step2_system_completeness(data):
-    """
-    ตรวจสอบเฉพาะข้อมูลที่จำเป็นสำหรับส่วนที่ 2 (คำนวณ Head Loss และสร้าง System Curve) เท่านั้น!
-    ไม่นำข้อมูลปั๊มหรือมอเตอร์มาล็อกส่วนที่ 2 เด็ดขาด
-    """
-    missing_step2 = []
 
+def post_process_extracted_data(extracted):
+    """
+    เติมเต็มข้อมูลที่เชื่อมโยงกันอัตโนมัติ เช่น ดึง Duty Head และ Efficiency จากตารางพิกัดกราฟปั๊ม
+    หากผู้ใช้งานให้ตารางกราฟปั๊มมาแต่ไม่ได้เขียนบรรทัดแยก เพื่อไม่ให้ขึ้น 'ไม่พบข้อมูล'
+    """
+    q_total = float(extracted.get("flow_rate_q_m3s") or 0.0)
+    num_pumps = int(extracted.get("num_parallel_pumps") or 1)
+    q_unit_target = q_total / max(num_pumps, 1) if q_total > 0 else 0.0
+
+    # ดึงขนาดและความยาวท่อจาก pipe_segments หากการ์ดหลักว่าง
+    segments = extracted.get("pipe_segments") or []
+    if segments:
+        if not extracted.get("main_pipe_diameter_m"):
+            for s in segments:
+                if s.get("diameter_m"):
+                    extracted["main_pipe_diameter_m"] = s["diameter_m"]
+                    break
+        if not extracted.get("main_pipe_length_m"):
+            total_l = sum(float(s.get("length_m") or 0.0) for s in segments)
+            if total_l > 0:
+                extracted["main_pipe_length_m"] = total_l
+        if not extracted.get("manning_n"):
+            for s in segments:
+                if s.get("manning_n"):
+                    extracted["manning_n"] = s["manning_n"]
+                    break
+
+    # หากมี total_minor_k แต่ไม่มีข้อความใน minor_loss_fittings ให้สร้างข้อความสรุป
+    if extracted.get("total_minor_k") and not extracted.get("minor_loss_fittings"):
+        extracted["minor_loss_fittings"] = [
+            f"อุปกรณ์ประกอบในระบบมีค่าสัมประสิทธิ์การสูญเสียรองรวม (Σk) = {extracted['total_minor_k']}"
+        ]
+
+    # ดึง Duty Head และ Efficiency จาก pump_curve_points ณ จุดใกล้เคียง Q ออกแบบ
+    pts = extracted.get("pump_curve_points") or []
+    if pts:
+        positive_pts = [p for p in pts if float(p.get("q_single_m3s") or 0.0) > 0]
+        chosen_pt = None
+        if positive_pts and q_unit_target > 0:
+            chosen_pt = min(positive_pts, key=lambda p: abs(float(p.get("q_single_m3s", 0.0)) - q_unit_target))
+        elif positive_pts:
+            chosen_pt = positive_pts[-1]
+
+        if chosen_pt:
+            if extracted.get("proposed_pump_head_m") is None and chosen_pt.get("head_m") is not None:
+                extracted["proposed_pump_head_m"] = float(chosen_pt["head_m"])
+            if extracted.get("proposed_pump_eff_pct") is None and chosen_pt.get("eff_pct") is not None:
+                if float(chosen_pt["eff_pct"]) > 0:
+                    extracted["proposed_pump_eff_pct"] = float(chosen_pt["eff_pct"])
+
+    return extracted
+
+
+def check_step2_completeness(data):
+    """ตรวจสอบข้อมูลสำหรับส่วนที่ 2 (ระบบท่อและ System Curve)"""
+    missing = []
     q_val = data.get("flow_rate_q_m3s")
     h_st = data.get("static_head_m")
     main_l = data.get("main_pipe_length_m")
@@ -95,52 +132,52 @@ def check_step2_system_completeness(data):
     has_roughness = bool(roughness_str or manning_n or darcy_f or has_seg_roughness)
 
     if not q_val or float(q_val) <= 0:
-        missing_step2.append(FIELD_THAI_MAP["flow_rate_q_m3s"])
+        missing.append(FIELD_THAI_MAP["flow_rate_q_m3s"])
     if h_st is None:
-        missing_step2.append(FIELD_THAI_MAP["static_head_m"])
+        missing.append(FIELD_THAI_MAP["static_head_m"])
     if not (has_valid_segment or has_valid_main):
         if not main_d or float(main_d or 0) <= 0:
-            missing_step2.append(FIELD_THAI_MAP["main_pipe_diameter_m"])
+            missing.append(FIELD_THAI_MAP["main_pipe_diameter_m"])
         if not main_l or float(main_l or 0) <= 0:
-            missing_step2.append(FIELD_THAI_MAP["main_pipe_length_m"])
+            missing.append(FIELD_THAI_MAP["main_pipe_length_m"])
     if not has_roughness:
-        missing_step2.append(FIELD_THAI_MAP["pipe_material_or_roughness"])
+        missing.append(FIELD_THAI_MAP["pipe_material_or_roughness"])
 
-    return (len(missing_step2) == 0), missing_step2
+    return (len(missing) == 0), missing
 
-def check_step4_pump_completeness(data, edited_pump_df):
+
+def check_step3_completeness(data):
+    """ตรวจสอบข้อมูลสำหรับส่วนที่ 3 (ต้องมีค่า Head ปั๊ม หรือตารางพิกัดกราฟปั๊ม)"""
+    pts = data.get("pump_curve_points") or []
+    has_head = (data.get("proposed_pump_head_m") is not None and float(data.get("proposed_pump_head_m") or 0) > 0)
+    has_pts = len(pts) > 0
+    if not (has_head or has_pts):
+        return False, [FIELD_THAI_MAP["proposed_pump_head_m"]]
+    return True, []
+
+
+def check_step4_completeness(data):
     """
-    ตรวจสอบข้อมูลที่จำเป็นสำหรับส่วนที่ 4 (พิจารณาเลือกปั๊ม กำลังมอเตอร์ และ NPSH)
-    แยกออกเป็นรายการที่ขาด เพื่อให้ล็อกเฉพาะส่วนที่คำนวณไม่ได้ หรือให้ผู้ใช้กดใช้ค่าแนะนำแทนได้
+    ตรวจสอบข้อมูลสำหรับส่วนที่ 4 (ต้องมีขนาดมอเตอร์ kW และประสิทธิภาพปั๊ม)
+    หากขาดตัวใดตัวหนึ่ง ส่วนที่ 4 จะถูกล็อกไว้จนกว่าผู้ใช้จะกด Force Access เพื่อป้อนค่าเอง
     """
-    missing_step4 = []
+    missing = []
+    has_motor = (data.get("proposed_motor_kw") is not None and float(data.get("proposed_motor_kw") or 0) > 0)
+    has_eff = (data.get("proposed_pump_eff_pct") is not None and float(data.get("proposed_pump_eff_pct") or 0) > 0)
+    has_gear = (data.get("proposed_gear_eff_pct") is not None and float(data.get("proposed_gear_eff_pct") or 0) > 0)
+    has_npshr = (data.get("proposed_npshr_m") is not None and float(data.get("proposed_npshr_m") or 0) > 0)
 
-    has_pump_head = (data.get("proposed_pump_head_m") is not None) or (
-        edited_pump_df is not None and not edited_pump_df.dropna(subset=["Head_m"]).empty
-    )
-    has_pump_eff = (data.get("proposed_pump_eff_pct") is not None)
-    has_gear_eff = (data.get("proposed_gear_eff_pct") is not None)
-    has_motor_kw = (data.get("proposed_motor_kw") is not None and float(data.get("proposed_motor_kw") or 0) > 0)
-    has_npshr = (data.get("proposed_npshr_m") is not None)
-
-    if not has_pump_head:
-        missing_step4.append(FIELD_THAI_MAP["proposed_pump_head_m"])
-    if not has_pump_eff:
-        missing_step4.append(FIELD_THAI_MAP["proposed_pump_eff_pct"])
-    if not has_gear_eff:
-        missing_step4.append(FIELD_THAI_MAP["proposed_gear_eff_pct"])
-    if not has_motor_kw:
-        missing_step4.append(FIELD_THAI_MAP["proposed_motor_kw"])
+    if not has_motor:
+        missing.append(FIELD_THAI_MAP["proposed_motor_kw"])
+    if not has_eff:
+        missing.append(FIELD_THAI_MAP["proposed_pump_eff_pct"])
+    if not has_gear:
+        missing.append(FIELD_THAI_MAP["proposed_gear_eff_pct"])
     if not has_npshr:
-        missing_step4.append(FIELD_THAI_MAP["proposed_npshr_m"])
+        missing.append(FIELD_THAI_MAP["proposed_npshr_m"])
 
-    return (len(missing_step4) == 0), missing_step4, {
-        "has_pump_head": has_pump_head,
-        "has_pump_eff": has_pump_eff,
-        "has_gear_eff": has_gear_eff,
-        "has_motor_kw": has_motor_kw,
-        "has_npshr": has_npshr
-    }
+    return (len(missing) == 0), missing
+
 
 def extract_text_from_file(uploaded_file):
     """ดึงข้อความจากไฟล์ PDF, CSV, Excel"""
@@ -162,9 +199,11 @@ def extract_text_from_file(uploaded_file):
         text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
     return text
 
+
 def encode_image(uploaded_file):
     """แปลงไฟล์ภาพเป็น Base64 สำหรับ OpenAI Vision"""
     return base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
+
 
 # ==========================================
 # 2. ฟังก์ชันคำนวณชลศาสตร์ (PHASE 2: HYDRAULIC ENGINE)
@@ -198,6 +237,10 @@ def run_hydraulic_engine(params, formula_override=None):
             "minor_loss_k_sum": float(params.get("total_minor_k") or 0.0),
             "fixed_minor_loss_m": float(params.get("fixed_minor_loss_m") or 0.0)
         }]
+    elif len(valid_segments) == 1 and params.get("total_minor_k"):
+        # หาก AI เก็บค่า k ไว้ที่ total_minor_k แต่ไม่ได้ใส่ใน segment เดี่ยว ให้ดึงมาใช้ด้วย
+        if float(valid_segments[0].get("minor_loss_k_sum") or 0.0) == 0.0:
+            valid_segments[0]["minor_loss_k_sum"] = float(params["total_minor_k"])
 
     breakdown_rows = []
     total_major_loss = 0.0
@@ -276,6 +319,7 @@ def run_hydraulic_engine(params, formula_override=None):
         "breakdown_df": pd.DataFrame(breakdown_rows)
     }
 
+
 # ==========================================
 # 3. ฟังก์ชันคำนวณกราฟปั๊มและหาจุดตัด (PHASE 3: PUMP CURVE ENGINE)
 # ==========================================
@@ -300,14 +344,15 @@ def evaluate_pump_vs_system(df_points, num_pumps, k_sys_m3s, h_static_m, q_targe
         curve_type_label = "Exact Model Curve (Polynomial Fit จากข้อมูลจริง)"
 
         if "Eff_pct" in clean_df.columns and clean_df["Eff_pct"].dropna().count() >= 3:
-            eff_Coef = np.polyfit(q_total_arr, clean_df["Eff_pct"].fillna(0).values.astype(float), 2)
+            eff_coef = np.polyfit(q_total_arr, clean_df["Eff_pct"].fillna(0).values.astype(float), 2)
         else:
-            eff_Coef = None
+            eff_coef = None
     else:
         if len(clean_df) >= 1:
             q_duty_single = float(clean_df["Q_single_m3s"].iloc[-1])
             h_duty = float(clean_df["Head_m"].iloc[-1])
-            eff_duty = float(clean_df["Eff_pct"].iloc[-1]) if ("Eff_pct" in clean_df.columns and pd.notna(clean_df["Eff_pct"].iloc[-1])) else 85.0
+            eff_col = clean_df["Eff_pct"] if "Eff_pct" in clean_df.columns else pd.Series([85.0])
+            eff_duty = float(eff_col.iloc[-1]) if pd.notna(eff_col.iloc[-1]) else 85.0
         else:
             q_duty_single = q_target_total_m3s / max(num_pumps, 1)
             h_duty = h_static_m * 1.5
@@ -322,7 +367,7 @@ def evaluate_pump_vs_system(df_points, num_pumps, k_sys_m3s, h_static_m, q_targe
         b_p = 0.0
         c_p = h_shutoff
         curve_type_label = "Synthesized / Approximated Curve (กราฟจำลองประมาณการ)"
-        eff_Coef = [-eff_duty / (q_duty_total_plot ** 2), (2.0 * eff_duty) / q_duty_total_plot, 0.0]
+        eff_coef = [-eff_duty / (q_duty_total_plot ** 2), (2.0 * eff_duty) / q_duty_total_plot, 0.0]
 
     A_eq = a_p - k_sys
     B_eq = b_p
@@ -347,21 +392,22 @@ def evaluate_pump_vs_system(df_points, num_pumps, k_sys_m3s, h_static_m, q_targe
 
     if q_op_plot is not None:
         h_op = (k_sys * (q_op_plot ** 2)) + h_static_m
-        if eff_Coef is not None:
-            eff_op = float(np.polyval(eff_Coef, q_op_plot))
+        if eff_coef is not None:
+            eff_op = float(np.polyval(eff_coef, q_op_plot))
             eff_op = max(0.0, min(95.0, eff_op))
 
     return {
         "is_synthesized": is_synthesized,
         "curve_type_label": curve_type_label,
         "poly_coeffs": (a_p, b_p, c_p),
-        "eff_coeffs": eff_Coef,
+        "eff_coeffs": eff_coef,
         "q_op_plot": q_op_plot,
         "q_op_m3s": (q_op_plot / scale) if q_op_plot is not None else None,
         "h_op_m": h_op,
         "eff_op_pct": eff_op,
         "clean_points_df": clean_df
     }
+
 
 # ==========================================
 # 4. ฟังก์ชันพิจารณาความเหมาะสมและอธิบายผลเชิงวิศวกรรม (PHASE 4 ENGINE)
@@ -379,60 +425,11 @@ def select_standard_motor_kw(min_req_kw):
             return float(rating)
     return math.ceil(min_req_kw / 100.0) * 100.0
 
-def evaluate_pipe_velocity_only(calc_res):
-    """
-    ตรวจสอบเฉพาะขนาดท่อและความเร็วน้ำ (สามารถทำงานและแสดงผลได้ทันทีโดยไม่ต้องรอสเปคปั๊ม!)
-    """
-    df_bd = calc_res["breakdown_df"]
-    vel_warnings = []
-    vel_details = []
-
-    for _, row in df_bd.iterrows():
-        seg_name = row["ช่วงระบบท่อ / อุปกรณ์"]
-        v_val = float(row["ความเร็ว V (m/s)"])
-        area_val = float(row["พื้นที่หน้าตัด A (m²)"])
-        is_siphon_or_culvert = any(k in seg_name.lower() for k in ["ไซฟอน", "siphon", "culvert", "ช่องรับน้ำ"])
-        v_max_limit = 3.0 if is_siphon_or_culvert else 3.5
-
-        if v_val > v_max_limit:
-            vel_warnings.append(
-                f"🔴 **{seg_name}:** ความเร็วน้ำสูงเกินเกณฑ์ ($V = {v_val:.2f}\\text{{ m/s}} > {v_max_limit:.1f}\\text{{ m/s}}$ บนพื้นที่หน้าตัด ${area_val:.2f}\\text{{ m}}^2$) "
-                f"→ **ผลกระทบ:** เกิดการสูญเสียเฮด (Head Loss) พุ่งสูงขึ้นอย่างรวดเร็ว เสี่ยงต่อการกัดเซาะผนังท่อ/คอนกรีต (Erosion) เกิดการสั่นสะเทือน (Hydraulic Vibration) และแรงกระแทกน้ำ (Water Hammer)"
-            )
-        elif 0 < v_val < 0.6 and "ปล่อง" not in seg_name and "shaft" not in seg_name.lower():
-            vel_warnings.append(
-                f"🟡 **{seg_name}:** ความเร็วน้ำต่ำกว่าเกณฑ์ทำความสะอาดตัวเอง ($V = {v_val:.2f}\\text{{ m/s}} < 0.60\\text{{ m/s}}$) "
-                f"→ **ผลกระทบ:** เสี่ยงต่อการตกตะกอนของทรายและโคลนตม (Sedimentation / Siltation) สะสมในท้องท่อหรือรางน้ำ ทำให้พื้นที่หน้าตัดการไหลลดลงในระยะยาว"
-            )
-        else:
-            vel_details.append(f"🟢 **{seg_name}:** $V = {v_val:.2f}\\text{{ m/s}}$ (พื้นที่หน้าตัด ${area_val:.2f}\\text{{ m}}^2$) — *อยู่ในเกณฑ์มาตรฐานวิศวกรรม ($0.6 - {v_max_limit:.1f}\\text{{ m/s}}$)*")
-
-    pipe_pass = len(vel_warnings) == 0
-    if pipe_pass:
-        pipe_status = "✅ ขนาดท่อเหมาะสม (PASS)"
-        pipe_narrative = (
-            "จากการตรวจสอบความเร็วการไหล ($V = Q/A$) ในทุกช่วงของแนวท่อและอุโมงค์ พบว่าขนาดหน้าตัดท่อมีความเหมาะสม "
-            "ความเร็วน้ำอยู่ในช่วงมาตรฐานวิศวกรรม ($0.6 - 3.5\\text{{ m/s}}$) ไม่พบจุดที่เสี่ยงต่อการกัดเซาะผนังท่อหรือการเกิดค้อนน้ำรุนแรง"
-        )
-    else:
-        pipe_status = f"⚠️ พบจุดเสี่ยงความเร็วน้ำ ({len(vel_warnings)} จุด)"
-        pipe_narrative = (
-            "จากการตรวจสอบความเร็วการไหล ($V = Q/A$) ตามขนาดหน้าตัดท่อที่กำหนด **พบช่วงท่อที่มีความเร็วน้ำอยู่นอกเกณฑ์แนะนำทางวิศวกรรม** "
-            "ซึ่งส่งผลกระทบโดยตรงต่อพฤติกรรมชลศาสตร์และความปลอดภัยของโครงสร้างดังนี้:"
-        )
-
-    return {
-        "pipe_pass": pipe_pass,
-        "pipe_status": pipe_status,
-        "pipe_narrative": pipe_narrative,
-        "vel_warnings": vel_warnings,
-        "vel_details": vel_details
-    }
 
 def evaluate_phase4_full(
     working_data, calc_res, pump_eval, num_active_pumps,
     pump_eff_pct, gear_eff_pct, safety_margin_pct, npshr_m,
-    proposed_motor_kw, is_approx_unlocked=False, missing_step4_list=None
+    user_motor_kw, is_force_unlocked=False, missing_step4_list=None
 ):
     """วิเคราะห์ความเหมาะสมเชิงวิศวกรรมครบทั้ง 5 ด้านสำหรับส่วนที่ 4"""
     rho = 1000.0
@@ -452,7 +449,7 @@ def evaluate_phase4_full(
     if pump_h_at_target <= 0 and q_target_total > 0:
         pump_h_at_target = float((a_p * (q_target_total ** 2)) + (b_p * q_target_total) + c_p)
 
-    # 1. อธิบายสิ่งที่เห็นบนกราฟ & โหมดการเดินเครื่อง
+    # 1. โหมดการเดินเครื่องและสิ่งที่เห็นบนกราฟ
     if num_active_pumps > 1:
         mode_title = f"การเดินเครื่องสูบน้ำแบบขนาน (Parallel Operation จำนวน {num_active_pumps} เครื่อง)"
         graph_narrative = (
@@ -520,12 +517,16 @@ def evaluate_phase4_full(
     p_min_motor_kw = p_gear_shaft_kw * (safety_margin_pct / 100.0)
     rec_standard_motor_kw = select_standard_motor_kw(p_min_motor_kw)
 
-    has_proposed_motor = (proposed_motor_kw is not None) and (float(proposed_motor_kw or 0) > 0)
+    has_motor = (user_motor_kw is not None) and (float(user_motor_kw or 0) > 0)
     eff_good = 78.0 <= eff_pump <= 92.0
-    eff_desc = f"อยู่ในเกณฑ์ดีและใกล้เคียงจุด BEP ({eff_pump:.1f}%)" if eff_good else f"ค่อนข้างต่ำและตกอยู่นอกช่วง BEP ({eff_pump:.1f}%) ซึ่งทำให้สิ้นเปลืองพลังงานสูงกว่าปกติ"
+    eff_desc = (
+        f"อยู่ในเกณฑ์ดีและใกล้เคียงจุด BEP ({eff_pump:.1f}%)"
+        if eff_good else
+        f"ค่อนข้างต่ำและตกอยู่นอกช่วง BEP ({eff_pump:.1f}%) ซึ่งทำให้สิ้นเปลืองพลังงานสูงกว่าปกติ"
+    )
 
-    if has_proposed_motor:
-        prop_motor_kw = float(proposed_motor_kw)
+    if has_motor:
+        prop_motor_kw = float(user_motor_kw)
         motor_pass = prop_motor_kw >= p_min_motor_kw
         actual_margin_pct = (prop_motor_kw / p_gear_shaft_kw) * 100.0 if p_gear_shaft_kw > 0 else 0.0
 
@@ -536,7 +537,7 @@ def evaluate_phase4_full(
                 f"และประสิทธิภาพชุดเกียร์ทดรอบอยู่ที่ **{eff_gear:.1f}%** คำนวณกำลังน้ำ (Hydraulic Power) ต่อเครื่องได้ **${p_hydraulic_kw:,.1f}\\text{{ kW}}$** "
                 f"คิดเป็นกำลังเพลาปั๊ม (Pump Shaft Power) **${p_pump_shaft_kw:,.1f}\\text{{ kW}}$** และกำลังเพลาเกียร์ (Gear Input Power) **${p_gear_shaft_kw:,.1f}\\text{{ kW}}$** "
                 f"เมื่อคูณเผื่อ Safety Margin ที่ **{safety_margin_pct:.0f}%** จะต้องการขนาดมอเตอร์ขั้นต่ำ **${p_min_motor_kw:,.1f}\\text{{ kW}}$** "
-                f"ดังนั้น มอเตอร์ขนาด **${prop_motor_kw:,.0f}\\text{{ kW}}$** ที่ระบุจึงมีความเหมาะสม (คิดเป็น Safety Margin จริง **{actual_margin_pct:.1f}%**) ไม่มีความเสี่ยงเรื่องการเกิด Overload"
+                f"ดังนั้น มอเตอร์ขนาด **${prop_motor_kw:,.0f}\\text{{ kW}}$** ที่ใช้พิจารณาจึงมีความเหมาะสม (คิดเป็น Safety Margin จริง **{actual_margin_pct:.1f}%**) ไม่มีความเสี่ยงเรื่องการเกิด Overload"
             )
         elif not motor_pass:
             power_status = f"❌ เสี่ยง Overload ({prop_motor_kw:,.0f} kW < {p_min_motor_kw:,.0f} kW)"
@@ -545,7 +546,7 @@ def evaluate_phase4_full(
                 f"**ไม่ผ่านเกณฑ์ขนาดมอเตอร์ (เสี่ยงเกิด Motor Overload):** ที่ประสิทธิภาพปั๊ม **{eff_pump:.1f}%** ({eff_desc}) และประสิทธิภาพเกียร์ **{eff_gear:.1f}%** "
                 f"ปั๊มต้องใช้กำลังเพลาปั๊มสูงถึง **${p_pump_shaft_kw:,.1f}\\text{{ kW}}$** และกำลังเพลาเกียร์ **${p_gear_shaft_kw:,.1f}\\text{{ kW}}$** "
                 f"เมื่อคิดเผื่อ Safety Margin **{safety_margin_pct:.0f}%** ตามมาตรฐานวิศวกรรม จะต้องใช้มอเตอร์ขนาดอย่างน้อย **${p_min_motor_kw:,.1f}\\text{{ kW}}$** "
-                f"แต่มอเตอร์ที่เสนอมีขนาดเพียง **${prop_motor_kw:,.0f}\\text{{ kW}}$** (ขาดไป **${overload_deficit:,.1f}\\text{{ kW}}$** หรือมี Margin เพียง {actual_margin_pct:.1f}%) "
+                f"แต่มอเตอร์ที่ระบุมีขนาดเพียง **${prop_motor_kw:,.0f}\\text{{ kW}}$** (ขาดไป **${overload_deficit:,.1f}\\text{{ kW}}$** หรือมี Margin เพียง {actual_margin_pct:.1f}%) "
                 f"**ผลกระทบ:** มอเตอร์จะเกิดความร้อนสะสม รันเกินพิกัด (Overload) และเบรกเกอร์ทริปตัดการทำงานเมื่อเดินเครื่องเต็มกำลัง **แนะนำให้ปรับเพิ่มขนาดมอเตอร์เป็นรุ่นมาตรฐาน ${rec_standard_motor_kw:,.0f}\\text{{ kW}}$ ต่อเครื่อง**"
             )
         else:
@@ -559,7 +560,7 @@ def evaluate_phase4_full(
         prop_motor_kw = None
         power_status = f"💡 แนะนำมอเตอร์ {rec_standard_motor_kw:,.0f} kW"
         power_narrative = (
-            f"**การคำนวณและแนะนำขนาดมอเตอร์ (กรณีไม่ได้ระบุขนาดมอเตอร์ในเอกสาร):** ที่ประสิทธิภาพเครื่องสูบน้ำ **{eff_pump:.1f}%** ({eff_desc}) "
+            f"**การคำนวณและแนะนำขนาดมอเตอร์:** ที่ประสิทธิภาพเครื่องสูบน้ำ **{eff_pump:.1f}%** ({eff_desc}) "
             f"และประสิทธิภาพชุดเกียร์ **{eff_gear:.1f}%** ระบบต้องการกำลังน้ำต่อเครื่อง **${p_hydraulic_kw:,.1f}\\text{{ kW}}$**, "
             f"กำลังเพลาปั๊ม (Pump Shaft Power) **${p_pump_shaft_kw:,.1f}\\text{{ kW}}$**, และกำลังเพลาเกียร์ (Gear Input Power) **${p_gear_shaft_kw:,.1f}\\text{{ kW}}$** "
             f"เมื่อคิดเผื่อ Safety Margin **{safety_margin_pct:.0f}%** จะต้องการกำลังมอเตอร์ขั้นต่ำ **${p_min_motor_kw:,.1f}\\text{{ kW}}$** "
@@ -567,7 +568,45 @@ def evaluate_phase4_full(
         )
 
     # 4. ความเหมาะสมของขนาดท่อและความเร็วน้ำ
-    pipe_eval = evaluate_pipe_velocity_only(calc_res)
+    df_bd = calc_res["breakdown_df"]
+    vel_warnings = []
+    vel_details = []
+
+    for _, row in df_bd.iterrows():
+        seg_name = row["ช่วงระบบท่อ / อุปกรณ์"]
+        v_val = float(row["ความเร็ว V (m/s)"])
+        area_val = float(row["พื้นที่หน้าตัด A (m²)"])
+        is_siphon_or_culvert = any(k in seg_name.lower() for k in ["ไซฟอน", "siphon", "culvert", "ช่องรับน้ำ"])
+        v_max_limit = 3.0 if is_siphon_or_culvert else 3.5
+
+        if v_val > v_max_limit:
+            vel_warnings.append(
+                f"🔴 **{seg_name}:** ความเร็วน้ำสูงเกินเกณฑ์ ($V = {v_val:.2f}\\text{{ m/s}} > {v_max_limit:.1f}\\text{{ m/s}}$ บนพื้นที่หน้าตัด ${area_val:.2f}\\text{{ m}}^2$) "
+                f"→ **ผลกระทบ:** เกิดการสูญเสียเฮด (Head Loss) พุ่งสูงขึ้นอย่างรวดเร็ว เสี่ยงต่อการกัดเซาะผนังท่อ/คอนกรีต (Erosion) เกิดการสั่นสะเทือน (Hydraulic Vibration) และแรงกระแทกน้ำ (Water Hammer)"
+            )
+        elif 0 < v_val < 0.6 and "ปล่อง" not in seg_name and "shaft" not in seg_name.lower():
+            vel_warnings.append(
+                f"🟡 **{seg_name}:** ความเร็วน้ำต่ำกว่าเกณฑ์ทำความสะอาดตัวเอง ($V = {v_val:.2f}\\text{{ m/s}} < 0.60\\text{{ m/s}}$) "
+                f"→ **ผลกระทบ:** เสี่ยงต่อการตกตะกอนของทรายและโคลนตม (Sedimentation / Siltation) สะสมในท้องท่อหรือรางน้ำ ทำให้พื้นที่หน้าตัดการไหลลดลงในระยะยาว"
+            )
+        else:
+            vel_details.append(
+                f"🟢 **{seg_name}:** $V = {v_val:.2f}\\text{{ m/s}}$ (พื้นที่หน้าตัด ${area_val:.2f}\\text{{ m}}^2$) — *อยู่ในเกณฑ์มาตรฐานวิศวกรรม ($0.6 - {v_max_limit:.1f}\\text{{ m/s}}$)*"
+            )
+
+    pipe_pass = len(vel_warnings) == 0
+    if pipe_pass:
+        pipe_status = "✅ ขนาดท่อเหมาะสม (PASS)"
+        pipe_narrative = (
+            "จากการตรวจสอบความเร็วการไหล ($V = Q/A$) ในทุกช่วงของแนวท่อและอุโมงค์ พบว่าขนาดหน้าตัดท่อมีความเหมาะสม "
+            "ความเร็วน้ำอยู่ในช่วงมาตรฐานวิศวกรรม ($0.6 - 3.5\\text{{ m/s}}$) ไม่พบจุดที่เสี่ยงต่อการกัดเซาะผนังท่อหรือการเกิดค้อนน้ำรุนแรง"
+        )
+    else:
+        pipe_status = f"⚠️ พบจุดเสี่ยงความเร็วน้ำ ({len(vel_warnings)} จุด)"
+        pipe_narrative = (
+            "จากการตรวจสอบความเร็วการไหล ($V = Q/A$) ตามขนาดหน้าตัดท่อที่กำหนด **พบช่วงท่อที่มีความเร็วน้ำอยู่นอกเกณฑ์แนะนำทางวิศวกรรม** "
+            "ซึ่งส่งผลกระทบโดยตรงต่อพฤติกรรมชลศาสตร์และความปลอดภัยของโครงสร้างดังนี้:"
+        )
 
     # 5. จุดเสี่ยง Off-BEP, ระดับน้ำบ่อสูบ และ NPSH / Cavitation Flags
     risk_flags = []
@@ -603,17 +642,16 @@ def evaluate_phase4_full(
             "การหาจุดตัดจึงอ้างอิงจากเส้นโค้งจำลอง ($H_{{shutoff}} = 1.30 H_{{duty}}$) ควรเรียกขอเอกสาร Performance Curve จริงจากโรงงานผู้ผลิตเพื่อยืนยันก่อนอนุมัติขั้นสุดท้าย"
         )
 
-    if is_approx_unlocked and missing_step4_list:
+    if is_force_unlocked and missing_step4_list:
         risk_flags.append(
-            f"⚠️ **หมายเหตุการปลดล็อกด้วยค่าประมาณการ (Approximated / Recommended Parameters Used):** การประเมินในส่วนที่ 4 นี้ใช้ค่าแนะนำ/ค่าจำลองแทนข้อมูลที่ขาดหายไป ได้แก่: "
-            f"**{', '.join(missing_step4_list)}** ผลลัพธ์นี้ใช้เพื่อการจำลองและวางแผนเบื้องต้นเท่านั้น ผู้ควบคุมงานต้องตรวจสอบกับเอกสาร Submittal จริงอีกครั้ง"
+            f"ℹ️ **หมายเหตุการปลดล็อกส่วนที่ 4 ด้วยตนเอง (Force Access Mode Active):** ผู้ใช้งานได้เปิดโหมดป้อนค่าพารามิเตอร์ทางกลเองสำหรับรายการที่ไม่ได้ระบุในต้นฉบับ ได้แก่: "
+            f"**{', '.join(missing_step4_list)}**"
         )
 
-    overall_suitable = qh_pass and motor_pass and eff_good and pipe_eval["pipe_pass"] and (npshr_m <= 6.5)
+    overall_suitable = qh_pass and motor_pass and eff_good and pipe_pass and (npshr_m <= 6.5)
 
     return {
         "overall_suitable": overall_suitable,
-        "is_approx_unlocked": is_approx_unlocked,
         "mode_title": mode_title,
         "graph_narrative": graph_narrative,
         "qh_pass": qh_pass,
@@ -630,17 +668,18 @@ def evaluate_phase4_full(
         "proposed_motor_kw": prop_motor_kw,
         "eff_pump_pct": eff_pump,
         "eff_gear_pct": eff_gear,
-        "pipe_pass": pipe_eval["pipe_pass"],
-        "pipe_status": pipe_eval["pipe_status"],
-        "pipe_narrative": pipe_eval["pipe_narrative"],
-        "vel_warnings": pipe_eval["vel_warnings"],
-        "vel_details": pipe_eval["vel_details"],
+        "pipe_pass": pipe_pass,
+        "pipe_status": pipe_status,
+        "pipe_narrative": pipe_narrative,
+        "vel_warnings": vel_warnings,
+        "vel_details": vel_details,
         "risk_flags": risk_flags,
         "sump_wl_m": sump_wl
     }
 
+
 # ==========================================
-# 5. โครงสร้างคำสั่ง AI (แยกข้อมูลท่อ กับ ข้อมูลปั๊ม ออกจากกันชัดเจน)
+# 5. โครงสร้างคำสั่ง AI (OPENAI FUNCTION CALLING SCHEMA)
 # ==========================================
 extraction_tool = [{
     "type": "function",
@@ -662,10 +701,11 @@ extraction_tool = [{
                 "pipe_material_or_roughness": {"type": "string"},
                 "manning_n": {"type": "number"},
                 "darcy_f": {"type": "number"},
+                "total_minor_k": {"type": "number", "description": "ผลรวมสัมประสิทธิ์การสูญเสียรอง k (ถ้าโจทย์ระบุรวมมา เช่น k = 13.5)"},
                 "system_type": {"type": "string"},
-                "proposed_pump_head_m": {"type": "number", "description": "ค่า Operating Head ของปั๊มที่ผู้รับจ้างเสนอ (m) ถ้าไม่ระบุให้ใส่ null"},
+                "proposed_pump_head_m": {"type": "number", "description": "ค่า Operating Head หรือ Rated Head ของปั๊มที่เสนอ (m) หากมีในตารางกราฟที่จุดใช้งานให้ดึงมาใส่ด้วย"},
                 "proposed_pump_shutoff_head_m": {"type": "number"},
-                "proposed_pump_eff_pct": {"type": "number", "description": "ประสิทธิภาพปั๊ม (%) ถ้าไม่ระบุให้ใส่ null"},
+                "proposed_pump_eff_pct": {"type": "number", "description": "ประสิทธิภาพปั๊มที่จุดใช้งาน (%) หากมีในตารางกราฟให้ดึงมาใส่ด้วย"},
                 "proposed_gear_eff_pct": {"type": "number", "description": "ประสิทธิภาพเกียร์ทดรอบ (%) ถ้าไม่ระบุให้ใส่ null"},
                 "proposed_motor_kw": {"type": "number", "description": "ขนาดกำลังมอเตอร์ที่เสนอ (kW) ถ้าไม่ระบุให้ใส่ null"},
                 "proposed_npshr_m": {"type": "number", "description": "ค่า NPSHr ของปั๊ม (m) ถ้าไม่ระบุให้ใส่ null"},
@@ -707,19 +747,9 @@ extraction_tool = [{
                     "type": "string",
                     "enum": ["high_multi_point", "single_duty_point_only", "uncertain_from_pdf_or_blurry", "no_pump_data"]
                 },
-                "ai_curve_advice_th": {"type": "string"},
-                "missing_system_curve_data": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "ระบุเฉพาะข้อมูลของ 'ระบบท่อและระดับน้ำ' ที่ขาดหายไปสำหรับคำนวณ System Curve (ได้แก่ อัตราการไหล Q, Static Head, ขนาดท่อ, ความยาวท่อ, ความขรุขระ) ห้ามใส่ข้อมูลปั๊มหรือมอเตอร์ลงในนี้ และต้องเขียนเป็นภาษาไทยเท่านั้น"
-                },
-                "missing_pump_selection_data": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "ระบุเฉพาะข้อมูลของ 'เครื่องสูบน้ำและมอเตอร์' ที่ไม่ได้ระบุมาสำหรับประเมินในส่วนที่ 4 (ได้แก่ เฮดปั๊มที่เสนอ, ประสิทธิภาพปั๊ม, ขนาดมอเตอร์ kW, ค่า NPSHr) เขียนเป็นภาษาไทยเท่านั้น"
-                }
+                "ai_curve_advice_th": {"type": "string"}
             },
-            "required": ["missing_system_curve_data", "missing_pump_selection_data", "pump_curve_confidence"]
+            "required": ["pump_curve_confidence"]
         }
     }
 }]
@@ -728,12 +758,10 @@ system_prompt = """
 คุณคือวิศวกรที่ปรึกษาอาวุโส (Lead QA/QC Site Engineer) ของบริษัท TEAM Consulting 
 หน้าที่ของคุณคืออ่านเอกสาร Submittal, BOQ, ตารางคำนวณ, รูปภาพกราฟ หรือข้อความจากหน้างาน และสกัดพารามิเตอร์ทางชลศาสตร์ออกมา
 
-กฎเหล็ก (Operational Rules):
-1. สื่อสารเป็น "ภาษาไทย" เสมอ ห้ามส่งชื่อตัวแปรภาษาอังกฤษดิบๆ (เช่น proposed_pump_head_m) ออกมาในรายการข้อมูลที่ขาดเด็ดขาด
-2. ห้ามเดาตัวเลขใดๆ ที่ผู้ใช้งานไม่ได้ระบุ หากไม่มีให้ใส่ค่าเป็น null
-3. แยกการตรวจสอบข้อมูลที่ขาดออกเป็น 2 ส่วนอย่างชัดเจน:
-   - `missing_system_curve_data`: เฉพาะข้อมูลระบบท่อที่จำเป็นต้องใช้คำนวณ Head Loss และสร้าง System Curve (อัตราการไหล Q, ระยะยกน้ำ Static Head, ขนาดท่อ D, ความยาวท่อ L, ค่าความขรุขระ n/f)
-   - `missing_pump_selection_data`: เฉพาะข้อมูลสเปคเครื่องสูบน้ำและมอเตอร์สำหรับใช้ตัดสินใจในส่วนที่ 4 (เฮดปั๊มที่เสนอ, ประสิทธิภาพปั๊ม, ขนาดมอเตอร์ kW, ค่า NPSHr)
+กฎเหล็ก:
+1. สื่อสารเป็นภาษาไทยเสมอ ห้ามเดาตัวเลขใดๆ ที่ผู้ใช้งานไม่ได้ระบุ หากไม่มีให้ใส่ค่าเป็น null
+2. หากผู้ใช้งานระบุค่า Minor Loss รวม (เช่น รวม k = 13.5) ให้ใส่ลงในทั้ง `total_minor_k`, ใน `minor_loss_k_sum` ของ `pipe_segments` และอธิบายใน `minor_loss_fittings`
+3. หากผู้ใช้งานให้ตารางพิกัดกราฟปั๊ม (`pump_curve_points`) มาหลายจุด ให้ดึงทุกจุดใส่ใน `pump_curve_points` และให้ดึงค่า Head และ Efficiency ณ จุดออกแบบมาใส่ใน `proposed_pump_head_m` และ `proposed_pump_eff_pct` ด้วย
 """
 
 # ==========================================
@@ -793,11 +821,7 @@ if st.button("🚀 สกัดข้อมูลและวิเคราะ�
 
             tool_call = response.choices[0].message.tool_calls[0]
             extracted = json.loads(tool_call.function.arguments)
-
-            if not extracted.get("main_pipe_diameter_m") and extracted.get("pipe_segments"):
-                first_d = extracted["pipe_segments"][0].get("diameter_m")
-                if first_d:
-                    extracted["main_pipe_diameter_m"] = first_d
+            extracted = post_process_extracted_data(extracted)
 
             st.session_state['extracted_params'] = extracted
             if 'custom_pump_points_df' in st.session_state:
@@ -806,7 +830,7 @@ if st.button("🚀 สกัดข้อมูลและวิเคราะ�
         st.error("🚨 กรุณาอัปโหลดไฟล์, ถ่ายรูป, หรือพิมพ์ข้อความก่อนกดปุ่มวิเคราะห์ครับ")
 
 # ==========================================
-# แสดงผลการ์ดพารามิเตอร์ & ระบบล็อก GATEKEEPER แยกส่วน (STEP 2 vs STEP 4)
+# แสดงผลการ์ดสรุปพารามิเตอร์ในส่วนที่ 1
 # ==========================================
 if 'extracted_params' in st.session_state:
     raw_data = st.session_state['extracted_params']
@@ -824,12 +848,238 @@ if 'extracted_params' in st.session_state:
     c5.metric("ขนาดท่อหลัก (Pipe Diameter)", format_metric(raw_data.get('main_pipe_diameter_m'), "m"))
     c6.metric("วัสดุ/ความขรุขระ (Roughness)", format_metric(raw_data.get('pipe_material_or_roughness'), ""))
 
-    with st.expander("🔧 ดูรายการอุปกรณ์ประกอบ (Minor Loss Fittings) และสเปคมอเตอร์", expanded=False):
-        st.write(f"**ลักษณะระบบ:** {format_metric(raw_data.get('system_type'), '')} | **จำนวนปั๊มเดินขนาน:** {format_metric(raw_data.get('num_parallel_pumps'), 'เครื่อง', 0)} | **ขนาดมอเตอร์ที่เสนอ:** {format_metric(raw_data.get('proposed_motor_kw'), 'kW', 0)}")
-        
+    with st.expander("🔧 ดูรายการอุปกรณ์ประกอบ (Minor Loss Fittings) และสเปคมอเตอร์", expanded=True):
+        sys_t = format_metric(raw_data.get('system_type'), '')
+        n_pumps = format_metric(raw_data.get('num_parallel_pumps'), 'เครื่อง', 0)
+        mot_kw = format_metric(raw_data.get('proposed_motor_kw'), 'kW', 0)
+        p_eff = format_metric(raw_data.get('proposed_pump_eff_pct'), '%', 1)
+        st.write(f"**ลักษณะระบบ:** {sys_t} | **จำนวนปั๊มเดินขนาน:** {n_pumps} | **ประสิทธิภาพปั๊ม:** {p_eff} | **ขนาดมอเตอร์ที่เสนอ:** {mot_kw}")
+
         fittings = raw_data.get('minor_loss_fittings') or []
         if fittings:
             for item in fittings:
                 st.write(f"- {item}")
         else:
             st.write("- ไม่พบข้อมูลอุปกรณ์ประกอบ")
+
+    # ตรวจสอบความครบถ้วนแยก 3 ด่าน (ส่วนที่ 2, ส่วนที่ 3, ส่วนที่ 4)
+    step2_ok, missing_s2 = check_step2_completeness(raw_data)
+    step3_ok, missing_s3 = check_step3_completeness(raw_data)
+    step4_ok, missing_s4 = check_step4_completeness(raw_data)
+
+    working_data = copy.deepcopy(raw_data)
+
+    # ==========================================
+    # 7. ส่วนที่ 2: คำนวณ HEAD LOSS & SYSTEM CURVE (พร้อมปุ่ม Force Access #2)
+    # ==========================================
+    st.divider()
+    st.subheader("2️⃣ ส่วนที่ 2: คำนวณ Head Loss และสร้างสมการ System Curve (H = KQ² + Hst)")
+
+    allow_step_2 = False
+    if step2_ok:
+        st.success("✅ **ข้อมูลระบบท่อครบถ้วน (Gatekeeper ส่วนที่ 2 ผ่านเกณฑ์):** คำนวณ Head Loss และสร้างสมการ System Curve อัตโนมัติ")
+        allow_step_2 = True
+        edit_pipe_manual = st.toggle("🛠️ ปรับแต่งพารามิเตอร์ระบบท่อด้วยตนเอง (Custom Pipe Parameters Override)", value=False)
+    else:
+        st.warning("🔒 **ส่วนที่ 2 ถูกล็อกชั่วคราว (Gatekeeper Locked):** ข้อมูลระบบท่อไม่เพียงพอสำหรับคำนวณ Head Loss และสร้าง System Curve")
+        for m in missing_s2:
+            st.error(f"❌ ขาดข้อมูลระบบท่อ: {m}")
+        edit_pipe_manual = st.toggle(
+            "🔓 **บังคับเข้าถึงส่วนที่ 2 เพื่อกรอกพารามิเตอร์ระบบท่อเอง (Force Access Part 2 - Input Pipe Data)**",
+            value=False
+        )
+        if edit_pipe_manual:
+            allow_step_2 = True
+
+    if edit_pipe_manual:
+        st.info("✍️ **แผงป้อน/ปรับแต่งพารามิเตอร์ระบบท่อ (Custom System Curve Inputs):**")
+        sb1, sb2, sb3 = st.columns(3)
+        with sb1:
+            sim_q = st.number_input("1. อัตราการไหลรวม Q (m³/s):", min_value=0.01, value=float(raw_data.get("flow_rate_q_m3s") or 60.0), step=1.0)
+            sim_hst = st.number_input("2. ระยะยกน้ำสถิต Static Head (m):", value=float(raw_data.get("static_head_m") if raw_data.get("static_head_m") is not None else 5.50), step=0.5)
+        with sb2:
+            sim_d = st.number_input("3. ขนาดเส้นผ่านศูนย์กลางท่อ D (m):", min_value=0.05, value=float(raw_data.get("main_pipe_diameter_m") or 5.0), step=0.1)
+            sim_l = st.number_input("4. ความยาวท่อ/อุโมงค์ L (m):", min_value=1.0, value=float(raw_data.get("main_pipe_length_m") or 8435.0), step=50.0)
+        with sb3:
+            sim_n = st.number_input("5. ค่าความขรุขระ Manning's n:", min_value=0.008, max_value=0.050, value=float(raw_data.get("manning_n") or 0.014), step=0.001, format="%.4f")
+            sim_k = st.number_input("6. ผลรวมสัมประสิทธิ์ Minor Loss (ΣK):", min_value=0.0, value=float(raw_data.get("total_minor_k") or 13.5), step=0.5)
+
+        working_data["flow_rate_q_m3s"] = sim_q
+        working_data["static_head_m"] = sim_hst
+        working_data["main_pipe_diameter_m"] = sim_d
+        working_data["main_pipe_length_m"] = sim_l
+        working_data["manning_n"] = sim_n
+        working_data["total_minor_k"] = sim_k
+        working_data["pipe_segments"] = [{
+            "segment_name": "ท่อหลัก / อุโมงค์ส่งน้ำ (Custom Input Conduit)",
+            "carries_single_pump_flow": False,
+            "diameter_m": sim_d,
+            "length_m": sim_l,
+            "manning_n": sim_n,
+            "darcy_f": float(raw_data.get("darcy_f") or 0.015),
+            "minor_loss_k_sum": sim_k,
+            "fixed_minor_loss_m": 0.0
+        }]
+
+    if allow_step_2:
+        cfg1, cfg2 = st.columns(2)
+        with cfg1:
+            formula_choice = st.selectbox(
+                "📐 เลือกสมการคำนวณความเสียดทานท่อตรง (Major Loss):",
+                ["Manning's Equation (งานอุโมงค์/ท่อระบายน้ำ)", "Darcy-Weisbach (งานท่อแรงดันมาตรฐาน)"]
+            )
+        with cfg2:
+            flow_unit_plot = st.selectbox(
+                "📊 หน่วยอัตราการไหลบนแกน X ของกราฟ:",
+                ["m³/s (ลูกบาศก์เมตรต่อวินาที)", "m³/h (ลูกบาศก์เมตรต่อชั่วโมง)"]
+            )
+
+        selected_method = "Darcy" if "Darcy" in formula_choice else "Manning"
+        calc_res = run_hydraulic_engine(working_data, formula_override=selected_method)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("ระยะยกน้ำสถิต (Hst)", f"{calc_res['h_static_m']:.2f} m")
+        m2.metric("ความเสียดทานท่อตรง (Major Loss)", f"{calc_res['total_major_loss_m']:.3f} m")
+        m3.metric("การสูญเสียตามอุปกรณ์ (Minor Loss)", f"{calc_res['total_minor_loss_m']:.3f} m")
+        m4.metric("เฮดรวมของระบบ (Total System Head)", f"{calc_res['total_system_head_m']:.3f} m")
+
+        use_m3h = "m³/h" in flow_unit_plot
+        scale_factor = 3600.0 if use_m3h else 1.0
+        k_display = calc_res['k_system_m3s'] / (scale_factor ** 2)
+        q_label = "Q (m³/h)" if use_m3h else "Q (m³/s)"
+        q_design = calc_res['q_total_m3h'] if use_m3h else calc_res['q_total_m3s']
+
+        eq_str = (
+            f"H = ({k_display:.4e}) · Q² + {calc_res['h_static_m']:.2f}"
+            if use_m3h else
+            f"H = {k_display:.6f} · Q² + {calc_res['h_static_m']:.2f}"
+        )
+        st.info(f"🧮 **สมการ System Curve ของระบบ:**  `{eq_str}`   *(โดยที่ Dynamic Head Loss รวม = `{calc_res['total_dynamic_loss_m']:.3f} m` ที่ Q = `{q_design:,.1f}`)*")
+
+        with st.expander("📑 ดูตารางแจกแจงการคำนวณความเร็ว (V) และ Head Loss รายช่วง", expanded=True):
+            st.dataframe(calc_res["breakdown_df"], use_container_width=True, hide_index=True)
+
+        # ==========================================
+        # 8. ส่วนที่ 3: เปรียบเทียบกับ PUMP CURVE และหาจุดตัด (พร้อมปุ่ม Force Access #3)
+        # ==========================================
+        st.divider()
+        st.subheader("3️⃣ ส่วนที่ 3: เปรียบเทียบกับกราฟปั๊ม (Pump Curve vs. System Curve) และหาจุด Operating Point")
+
+        allow_step_3 = False
+        if step3_ok:
+            st.success("✅ **พบข้อมูลสเปคเฮดปั๊ม/กราฟปั๊ม (Gatekeeper ส่วนที่ 3 ผ่านเกณฑ์):** พร้อมพล็อตกราฟเปรียบเทียบหาจุดตัด Operating Point")
+            allow_step_3 = True
+        else:
+            st.warning("🔒 **ส่วนที่ 3 ถูกล็อกชั่วคราว (Gatekeeper Locked):** ไม่พบข้อมูลเฮดปั๊มที่เสนอ (Proposed Pump Head) หรือพิกัดกราฟปั๊มในเอกสาร")
+            for m3 in missing_s3:
+                st.error(f"❌ ขาดข้อมูลปั๊ม: {m3}")
+            force_step_3 = st.toggle(
+                "🔓 **บังคับเข้าถึงส่วนที่ 3 เพื่อกรอกสเปคเฮดปั๊มหรือพิกัดกราฟปั๊มเอง (Force Access Part 3 - Input Pump Curve)**",
+                value=False
+            )
+            if force_step_3:
+                allow_step_3 = True
+
+        if allow_step_3:
+            num_pumps_default = int(working_data.get("num_parallel_pumps") or 1)
+            q_unit_default = calc_res["q_total_m3s"] / max(num_pumps_default, 1)
+            h_duty_default = float(working_data.get("proposed_pump_head_m") or calc_res["total_system_head_m"] or 23.0)
+            eff_default = float(working_data.get("proposed_pump_eff_pct") or 85.0)
+
+            if 'custom_pump_points_df' not in st.session_state:
+                ai_points = working_data.get("pump_curve_points") or []
+                if len(ai_points) >= 1:
+                    init_rows = [
+                        {
+                            "Q_single_m3s": float(pt.get("q_single_m3s", 0.0)),
+                            "Head_m": float(pt.get("head_m", 0.0)),
+                            "Eff_pct": float(pt.get("eff_pct") if pt.get("eff_pct") is not None else eff_default)
+                        }
+                        for pt in ai_points
+                    ]
+                else:
+                    init_rows = [
+                        {"Q_single_m3s": round(q_unit_default, 2), "Head_m": round(h_duty_default, 2), "Eff_pct": round(eff_default, 1)}
+                    ]
+                st.session_state['custom_pump_points_df'] = pd.DataFrame(init_rows)
+
+            curve_conf = working_data.get("pump_curve_confidence", "single_duty_point_only")
+            ai_advice = working_data.get("ai_curve_advice_th")
+
+            if curve_conf != "high_multi_point" or len(st.session_state['custom_pump_points_df']) < 3:
+                st.warning(
+                    "📸 **คำแนะนำจาก AI (ไม่พบพิกัดกราฟปั๊มแบบหลายจุดจากไฟล์เอกสาร/PDF):**\n"
+                    "- การอ่านไฟล์ PDF ด้วยข้อความอาจทำให้ AI มองไม่เห็นเส้นกราฟ Pump Curve หรือพบเพียงจุดใช้งานจุดเดียว (Duty Point)\n"
+                    "- **วิธีเพิ่มความแม่นยำ:** คุณสามารถ **แคปหน้าจอกราฟ Pump Curve เป็นไฟล์รูปภาพ (PNG/JPG) แล้วอัปโหลดในส่วนที่ 1** เพื่อให้ AI Vision อ่านเส้นกราฟ หรือ **พิมพ์เพิ่มจุดสำคัญจากกราฟอย่างน้อย 3 จุด** (เช่น จุด `Q=0 Shutoff`, จุด `Design/BEP`, และจุด `Max Flow/Runout`) ลงในตารางด้านล่างได้โดยตรงครับ"
+                )
+                if ai_advice:
+                    st.caption(f"💬 *หมายเหตุจาก AI: {ai_advice}*")
+
+            p_col1, p_col2 = st.columns([1, 2])
+            with p_col1:
+                st.markdown("##### ⚙️ รูปแบบการเดินเครื่องสูบน้ำ")
+                operation_mode = st.radio(
+                    "เลือกโหมดการเดินเครื่อง:",
+                    ["เดินเครื่องแบบขนาน (Parallel Operation)", "เดินเครื่องสูบน้ำเดี่ยว (Single Pump)"],
+                    index=0 if num_pumps_default > 1 else 1
+                )
+                if "ขนาน" in operation_mode:
+                    num_active_pumps = st.number_input(
+                        "จำนวนปั๊มที่เดินขนานพร้อมกัน (เครื่อง):",
+                        min_value=1, max_value=20, value=max(num_pumps_default, 2), step=1
+                    )
+                else:
+                    num_active_pumps = 1
+
+                if st.button("✨ โหลดตัวอย่างพิกัดจริง 5 จุด (Exact Model Curve)", use_container_width=True):
+                    st.session_state['custom_pump_points_df'] = pd.DataFrame([
+                        {"Q_single_m3s": 0.0, "Head_m": round(h_duty_default * 1.34, 2), "Eff_pct": 0.0},
+                        {"Q_single_m3s": round(q_unit_default * 0.6, 2), "Head_m": round(h_duty_default * 1.23, 2), "Eff_pct": 74.0},
+                        {"Q_single_m3s": round(q_unit_default * 0.8, 2), "Head_m": round(h_duty_default * 1.15, 2), "Eff_pct": 82.0},
+                        {"Q_single_m3s": round(q_unit_default * 1.0, 2), "Head_m": round(h_duty_default * 1.00, 2), "Eff_pct": eff_default},
+                        {"Q_single_m3s": round(q_unit_default * 1.2, 2), "Head_m": round(h_duty_default * 0.79, 2), "Eff_pct": 76.0},
+                    ])
+                    st.rerun()
+
+            with p_col2:
+                st.markdown("##### 📝 ตารางพิกัดกราฟปั๊มต่อ 1 เครื่อง (เพิ่ม/แก้ไขแถวได้ — ใส่ ≥ 3 จุดเพื่อทำ Exact Polynomial Fit)")
+                edited_pump_df = st.data_editor(
+                    st.session_state['custom_pump_points_df'],
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "Q_single_m3s": st.column_config.NumberColumn("Q ปั๊มเดี่ยว (m³/s)", min_value=0.0, step=0.5, format="%.2f"),
+                        "Head_m": st.column_config.NumberColumn("Head ปั๊ม (m)", min_value=0.0, step=0.5, format="%.2f"),
+                        "Eff_pct": st.column_config.NumberColumn("Efficiency (%)", min_value=0.0, max_value=100.0, step=1.0, format="%.1f")
+                    }
+                )
+
+            pump_eval = evaluate_pump_vs_system(
+                df_points=edited_pump_df,
+                num_pumps=num_active_pumps,
+                k_sys_m3s=calc_res["k_system_m3s"],
+                h_static_m=calc_res["h_static_m"],
+                q_target_total_m3s=calc_res["q_total_m3s"],
+                use_m3h=use_m3h
+            )
+
+            if pump_eval["is_synthesized"]:
+                st.error(
+                    "⚠️ **หมายเหตุสำคัญ (Synthesized / Approximated Curve):** เนื่องจากมีข้อมูลพิกัดปั๊มน้อยกว่า 3 จุด "
+                    "กราฟเส้นโค้งของปั๊มด้านล่างจึงเป็น **กราฟจำลองจากการประมาณการทางวิศวกรรม ($H_{shutoff} \\approx 1.30 H_{duty}$)** "
+                    "หากต้องการผลลัพธ์จุดตัด Operating Point ที่แม่นยำตามรุ่นจริง กรุณาอัปโหลดรูปภาพกราฟ Pump Curve หรือกรอกพิกัด (Q, H) ในตารางด้านบนให้ครบอย่างน้อย 3 จุดครับ"
+                )
+            else:
+                st.success(
+                    f"✅ **Exact Model Curve Active:** สร้างสมการเส้นโค้งปั๊มด้วยวิธี **Polynomial Fit (กำลังสอง)** จากข้อมูลพิกัดจริงจำนวน {len(pump_eval['clean_points_df'])} จุดเรียบร้อยแล้ว"
+                )
+
+            op1, op2, op3, op4 = st.columns(4)
+            if pump_eval["q_op_plot"] is not None:
+                q_op_disp = f"{pump_eval['q_op_plot']:,.2f} {'m³/h' if use_m3h else 'm³/s'}"
+                h_op_disp = f"{pump_eval['h_op_m']:,.2f} m"
+                eff_op_disp = f"{pump_eval['eff_op_pct']:.1f} %" if pump_eval["eff_op_pct"] is not None else "N/A"
+                q_diff_m3s = pump_eval["q_op_m3s"] - calc_res["q_total_m3s"]
+                flow_status = "✅ เพียงพอ (PASS)" if q_diff_m3s >= -0.05 else f"❌ ขาดไป {abs(q_diff_m3s):.2f} m³/s"
+            else:
+                q_op_disp, h_op_disp, eff_op_disp, flow_status = "ไม่ตัดกัน",
