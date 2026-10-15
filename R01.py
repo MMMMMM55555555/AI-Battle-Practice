@@ -714,7 +714,7 @@ if 'extracted_params' in st.session_state:
         # พล็อตกราฟรวม SYSTEM CURVE vs PUMP CURVE & OPERATING POINT
         # ==========================================
         a_p, b_p, c_p = pump_eval["poly_coeffs"]
-        q_max_ candidates = [q_design * 1.35]
+        q_max_candidates = [q_design * 1.35]
         if pump_eval["q_op_plot"]:
             q_max_candidates.append(pump_eval["q_op_plot"] * 1.25)
         q_max_plot = max(q_max_candidates) if max(q_max_candidates) > 0 else 100.0
