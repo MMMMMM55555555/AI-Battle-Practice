@@ -6,6 +6,7 @@ from openai import OpenAI
 import json
 import base64
 import math
+import copy
 import plotly.graph_objects as go
 
 # --- ตั้งค่าหน้าจอ (PAGE CONFIG) ---
@@ -17,15 +18,14 @@ st.caption("รองรับตั้งแต่งานระบบท่�
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # ==========================================
-# 1. ฟังก์ชันช่วยเหลือ & จัดการแสดงผลหน่วย (UI HELPERS)
+# 1. ฟังก์ชันช่วยเหลือ & ตรวจสอบความครบถ้วน (HELPERS & GATEKEEPER)
 # ==========================================
 def format_metric(val, unit="", decimals=2):
-    """ฟังก์ชันแก้ปัญหา 'ไม่พบข้อมูล m' - จะแสดงหน่วยก็ต่อเมื่อมีตัวเลขจริงเท่านั้น"""
+    """แสดงหน่วยวัดเฉพาะเมื่อมีตัวเลขจริงเท่านั้น หากไม่มีข้อมูลจะแสดง 'ไม่พบข้อมูล' ล้วนๆ"""
     if val is None or val == "" or str(val).strip().lower() in ["none", "null", "n/a", "ไม่พบข้อมูล"]:
         return "ไม่พบข้อมูล"
     try:
         num = float(val)
-        # ถ้าน้อยกว่า 1 และไม่ใช่ 0 ให้โชว์ทศนิยมละเอียดขึ้น (เช่น Manning n = 0.014)
         if 0 < abs(num) < 0.1 and decimals == 2:
             formatted = f"{num:.4f}"
         elif num.is_integer():
@@ -35,6 +35,45 @@ def format_metric(val, unit="", decimals=2):
         return f"{formatted} {unit}".strip()
     except (ValueError, TypeError):
         return f"{val} {unit}".strip() if unit else str(val)
+
+def check_data_completeness(data):
+    """
+    ตรวจสอบอย่างเข้มงวดว่าข้อมูลเพียงพอสำหรับคำนวณ Head Loss และสร้าง System Curve หรือไม่
+    ป้องกันไม่ให้กราฟพล็อตเป็นเส้นตรง H = Hst เมื่อความยาวท่อ L = 0
+    """
+    reasons = list(data.get("missing_critical_data") or [])
+
+    q_val = data.get("flow_rate_q_m3s")
+    h_st = data.get("static_head_m")
+    main_l = data.get("main_pipe_length_m")
+    main_d = data.get("main_pipe_diameter_m")
+    segments = data.get("pipe_segments") or []
+
+    # ตรวจสอบว่ามีช่วงท่อที่สามารถคำนวณ Head Loss ได้จริงหรือไม่ (ต้องมีขนาดท่อ และมี L > 0 หรือ K > 0)
+    has_valid_segment = False
+    for seg in segments:
+        seg_d = seg.get("diameter_m") or seg.get("area_m2")
+        seg_l = float(seg.get("length_m") or 0.0)
+        seg_k = float(seg.get("minor_loss_k_sum") or 0.0)
+        seg_fixed = float(seg.get("fixed_minor_loss_m") or 0.0)
+        if seg_d and (seg_l > 0 or seg_k > 0 or seg_fixed > 0):
+            has_valid_segment = True
+            break
+
+    has_valid_main = bool(main_d and float(main_d) > 0 and main_l and float(main_l) > 0)
+
+    if not q_val or float(q_val) <= 0:
+        if not any("อัตราการไหล" in r or "Q" in r for r in reasons):
+            reasons.append("อัตราการไหลที่ต้องการ (Flow Rate Q)")
+    if h_st is None:
+        if not any("Static" in r or "ระดับน้ำ" in r or "ระยะยก" in r for r in reasons):
+            reasons.append("ระยะยกน้ำสถิต (Static Head) หรือระดับน้ำต้นทาง-ปลายทาง")
+    if not (has_valid_segment or has_valid_main):
+        if not any("ความยาว" in r for r in reasons):
+            reasons.append("ความยาวของท่อหรืออุโมงค์ (Pipe/Tunnel Length > 0 m) และขนาดท่อ")
+
+    is_complete = (len(reasons) == 0) and (q_val is not None and float(q_val) > 0) and (h_st is not None) and (has_valid_segment or has_valid_main)
+    return is_complete, reasons
 
 def extract_text_from_file(uploaded_file):
     """ดึงข้อความจากไฟล์ PDF, CSV, Excel"""
@@ -64,37 +103,42 @@ def encode_image(uploaded_file):
 # 2. ฟังก์ชันคำนวณชลศาสตร์ (PHASE 2: HYDRAULIC ENGINE)
 # ==========================================
 def run_hydraulic_engine(params, formula_override=None):
-    """
-    คำนวณ Major Loss, Minor Loss, ความเร็ว V และสร้างสมการ H = K*Q^2 + Hst
-    รองรับทั้งท่อเดี่ยวทั่วไป และระบบหลายช่วง (เช่น อุโมงค์ดูด + ไซฟอน + อุโมงค์ระบาย)
-    """
+    """คำนวณ Major Loss, Minor Loss, ความเร็ว V และสร้างสมการ H = K*Q^2 + Hst"""
     g = 9.81
     q_total = float(params.get("flow_rate_q_m3s") or 0.0)
     h_static = float(params.get("static_head_m") or 0.0)
     num_pumps = int(params.get("num_parallel_pumps") or 1)
-    
+
     segments = params.get("pipe_segments") or []
-    
-    # หาก AI ดึงมาแต่ค่าพื้นฐาน (ไม่มี array ของ segments) ให้สร้าง segment อัตโนมัติจากค่าหลัก
-    if not segments and params.get("main_pipe_diameter_m") and params.get("main_pipe_length_m"):
-        segments = [{
+
+    # กรณีมีแค่พารามิเตอร์หลักหรือมาจากโหมดจำลองข้อมูลเอง (Sandbox)
+    valid_segments = [
+        s for s in segments
+        if (s.get("diameter_m") or s.get("area_m2")) and (
+            float(s.get("length_m") or 0) > 0 or
+            float(s.get("minor_loss_k_sum") or 0) > 0 or
+            float(s.get("fixed_minor_loss_m") or 0) > 0
+        )
+    ]
+
+    if not valid_segments:
+        valid_segments = [{
             "segment_name": "ท่อหลัก / อุโมงค์ส่งน้ำ (Main Conduit)",
-            "flow_regime": params.get("system_type") or "Closed_Pressure",
             "carries_single_pump_flow": False,
-            "diameter_m": float(params.get("main_pipe_diameter_m")),
+            "diameter_m": float(params.get("main_pipe_diameter_m") or 1.0),
             "area_m2": None,
-            "length_m": float(params.get("main_pipe_length_m")),
+            "length_m": float(params.get("main_pipe_length_m") or 100.0),
             "manning_n": float(params.get("manning_n") or 0.014),
             "darcy_f": float(params.get("darcy_f") or 0.015),
             "minor_loss_k_sum": float(params.get("total_minor_k") or 0.0),
-            "fixed_minor_loss_m": 0.0
+            "fixed_minor_loss_m": float(params.get("fixed_minor_loss_m") or 0.0)
         }]
 
     breakdown_rows = []
     total_major_loss = 0.0
     total_minor_loss = 0.0
 
-    for idx, seg in enumerate(segments, start=1):
+    for idx, seg in enumerate(valid_segments, start=1):
         name = seg.get("segment_name", f"ช่วงท่อที่ {idx}")
         is_unit_flow = bool(seg.get("carries_single_pump_flow", False))
         q_seg = (q_total / max(num_pumps, 1)) if is_unit_flow else q_total
@@ -103,7 +147,6 @@ def run_hydraulic_engine(params, formula_override=None):
         area = seg.get("area_m2")
         w_perim = seg.get("wetted_perimeter_m")
 
-        # คำนวณพื้นที่หน้าตัด A และรัศมีชลศาสตร์ R_h
         if d_m and float(d_m) > 0:
             d_m = float(d_m)
             area = (math.pi * (d_m ** 2)) / 4.0 if not area else float(area)
@@ -124,7 +167,6 @@ def run_hydraulic_engine(params, formula_override=None):
         k_sum = float(seg.get("minor_loss_k_sum") or 0.0)
         fixed_minor = float(seg.get("fixed_minor_loss_m") or 0.0)
 
-        # เลือกสมการคำนวณ Major Loss (Manning vs Darcy-Weisbach)
         calc_method = formula_override or seg.get("preferred_formula") or "Manning"
         if "darcy" in calc_method.lower():
             h_major = f_val * (length / d_m) * ((velocity ** 2) / (2.0 * g)) if length > 0 else 0.0
@@ -133,7 +175,6 @@ def run_hydraulic_engine(params, formula_override=None):
             h_major = ((n_val ** 2) * (velocity ** 2) * length) / (r_h ** (4.0 / 3.0)) if length > 0 else 0.0
             method_label = f"Manning (n={n_val:.3f})"
 
-        # คำนวณ Minor Loss จากค่าสัมประสิทธิ์ K (zeta) + ค่าสูญเสียคงที่ (เช่น ฝาย/ตะแกรงที่ทราบค่า)
         h_minor = (k_sum * ((velocity ** 2) / (2.0 * g))) + fixed_minor
         h_seg_total = h_major + h_minor
 
@@ -156,8 +197,6 @@ def run_hydraulic_engine(params, formula_override=None):
 
     total_dynamic_loss = total_major_loss + total_minor_loss
     total_system_head = h_static + total_dynamic_loss
-
-    # สร้างสัมประสิทธิ์ความต้านทานของระบบ K จากสมการ H = K * Q^2 + Hst
     k_system_m3s = (total_dynamic_loss / (q_total ** 2)) if q_total > 0 else 0.0
 
     return {
@@ -173,7 +212,7 @@ def run_hydraulic_engine(params, formula_override=None):
     }
 
 # ==========================================
-# 3. โครงสร้างคำสั่ง AI (THE GATEKEEPER & MULTI-SEGMENT SCHEMA)
+# 3. โครงสร้างคำสั่ง AI (THE GATEKEEPER SCHEMA)
 # ==========================================
 extraction_tool = [{
     "type": "function",
@@ -187,17 +226,14 @@ extraction_tool = [{
                 "flow_rate_q_m3s": {"type": "number", "description": "อัตราการไหลรวมที่ต้องการของระบบในหน่วย m3/s (หากต้นฉบับเป็น m3/h ให้หาร 3600 เป็น m3/s)"},
                 "flow_rate_original_text": {"type": "string", "description": "ค่าอัตราการไหลพร้อมหน่วยตามที่ปรากฏในเอกสาร เช่น '60 m3/s' หรือ '400 m3/h'"},
                 "num_parallel_pumps": {"type": "integer", "description": "จำนวนเครื่องสูบน้ำที่เดินขนานกัน (ถ้าเป็นปั๊มเดี่ยวให้ใส่ 1)"},
-                "static_head_m": {"type": "number", "description": "ระยะยกน้ำสถิต (Static Head / Hst) หรือผลต่างระดับน้ำต้นทาง-ปลายทาง (m)"},
-                "suction_wl_m": {"type": "number", "description": "ระดับน้ำฝั่งดูด (m.MSL) ถ้ามี"},
-                "discharge_wl_m": {"type": "number", "description": "ระดับน้ำฝั่งระบายออก (m.MSL) ถ้ามี"},
-                "main_pipe_length_m": {"type": "number", "description": "ความยาวรวมของท่อหรืออุโมงค์หลัก (m)"},
-                "main_pipe_diameter_m": {"type": "number", "description": "ขนาดเส้นผ่านศูนย์กลางท่อหรืออุโมงค์หลักในหน่วยเมตร (m)"},
+                "static_head_m": {"type": "number", "description": "ระยะยกน้ำสถิต (Static Head / Hst) หรือผลต่างระดับน้ำต้นทาง-ปลายทาง (m) ห้ามเดาค่าเองเด็ดขาด"},
+                "main_pipe_length_m": {"type": "number", "description": "ความยาวรวมของท่อหรืออุโมงค์หลัก (m) ห้ามเดาค่าเอง"},
+                "main_pipe_diameter_m": {"type": "number", "description": "ขนาดเส้นผ่านศูนย์กลางท่อหรืออุโมงค์หลักในหน่วยเมตร (m) หากระบุในช่วงท่อให้ดึงมาใส่ด้วย"},
                 "pipe_material_or_roughness": {"type": "string", "description": "วัสดุท่อ และค่าความขรุขระ เช่น 'Concrete (Manning n = 0.014)'"},
-                "manning_n": {"type": "number", "description": "ค่าสัมประสิทธิ์ความขรุขระ Manning's n (เช่น 0.014)"},
-                "darcy_f": {"type": "number", "description": "ค่า Friction factor f ของ Darcy-Weisbach (ถ้าไม่ระบุให้ประเมินตามวัสดุ เช่น 0.015)"},
-                "system_type": {"type": "string", "description": "ลักษณะระบบ เช่น 'ระบบปิด (Pressure)' หรือ 'ระบบเปิดผสมท่อปิด (Gravity + Pressure)'"},
+                "manning_n": {"type": "number", "description": "ค่าสัมประสิทธิ์ความขรุขระ Manning's n (เช่น 0.014) ถ้าไม่ได้ระบุให้ใส่ null"},
+                "darcy_f": {"type": "number", "description": "ค่า Friction factor f ของ Darcy-Weisbach ถ้าไม่ได้ระบุให้ใส่ null"},
+                "system_type": {"type": "string", "description": "ลักษณะระบบ เช่น 'ระบบปิด (Pressure)' หรือ 'ระบบเปิดผสมท่อปิด'"},
                 "proposed_pump_head_m": {"type": "number", "description": "ค่า Operating Head หรือ Total Head ของปั๊มที่ผู้รับจ้างเสนอ (m)"},
-                "proposed_pump_max_head_m": {"type": "number", "description": "ค่า Specified Max Head ของปั๊ม (m) ถ้ามี"},
                 "proposed_pump_eff_pct": {"type": "number", "description": "ประสิทธิภาพปั๊ม (%) ถ้ามี"},
                 "proposed_motor_kw": {"type": "number", "description": "ขนาดกำลังมอเตอร์ที่เสนอ (kW) ถ้ามี"},
                 "minor_loss_fittings": {
@@ -207,19 +243,19 @@ extraction_tool = [{
                 },
                 "pipe_segments": {
                     "type": "array",
-                    "description": "แยกช่วงการคำนวณแนวท่อ/อุโมงค์/ท่อไซฟอน เพื่อคำนวณ Major และ Minor Loss อย่างละเอียด",
+                    "description": "แยกช่วงการคำนวณแนวท่อ/อุโมงค์/ท่อไซฟอน",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "segment_name": {"type": "string", "description": "ชื่อช่วงท่อ เช่น '1. อุโมงค์ฝั่งดูด', '2. ท่อไซฟอนในสถานี', '3. อุโมงค์ฝั่งระบาย'"},
-                            "carries_single_pump_flow": {"type": "boolean", "description": "เป็น True เฉพาะช่วงท่อที่แยกเข้าปั๊มแต่ละตัว เช่น ช่องรับน้ำหน้าปั๊มหรือท่อไซฟอน"},
-                            "diameter_m": {"type": "number", "description": "เส้นผ่านศูนย์กลางท่อ (m)"},
-                            "area_m2": {"type": "number", "description": "พื้นที่หน้าตัดการไหล (m2) กรณีเป็นท่อเหลี่ยมหรือไซฟอน"},
-                            "length_m": {"type": "number", "description": "ความยาวช่วงท่อนี้ (m)"},
-                            "manning_n": {"type": "number", "description": "ค่า Manning n ของช่วงนี้"},
-                            "darcy_f": {"type": "number", "description": "ค่า Darcy f ของช่วงนี้"},
-                            "minor_loss_k_sum": {"type": "number", "description": "ผลรวมค่าสัมประสิทธิ์การสูญเสียรอง (sum of k / zeta) ทั้งหมดในsegmentนี้ (คูณจำนวนจุดแล้ว)"},
-                            "fixed_minor_loss_m": {"type": "number", "description": "ผลรวมค่า Head Loss ย่อยที่โจทย์ระบุมาเป็นหน่วยเมตรโดยตรง (m) เช่น ฝาย, ตะแกรง, จุดตัดปล่องที่ระบุเป็นเมตร"}
+                            "segment_name": {"type": "string"},
+                            "carries_single_pump_flow": {"type": "boolean"},
+                            "diameter_m": {"type": "number"},
+                            "area_m2": {"type": "number"},
+                            "length_m": {"type": "number"},
+                            "manning_n": {"type": "number"},
+                            "darcy_f": {"type": "number"},
+                            "minor_loss_k_sum": {"type": "number"},
+                            "fixed_minor_loss_m": {"type": "number"}
                         },
                         "required": ["segment_name"]
                     }
@@ -237,15 +273,18 @@ extraction_tool = [{
 
 system_prompt = """
 คุณคือวิศวกรที่ปรึกษาอาวุโส (Lead QA/QC Site Engineer) ของบริษัท TEAM Consulting 
-หน้าที่ของคุณคืออ่านเอกสาร Submittal, BOQ, ตารางคำนวณ, รูปภาพ หรือข้อความจากหน้างาน และสกัดพารามิเตอร์ทางชลศาสตร์ออกมาเพื่อส่งให้เครื่องคิดเลข Python คำนวณ System Curve
+หน้าที่ของคุณคืออ่านเอกสาร Submittal, BOQ, ตารางคำนวณ, รูปภาพ หรือข้อความจากหน้างาน และสกัดพารามิเตอร์ทางชลศาสตร์ออกมา
 
-กฎสำคัญในการสกัดข้อมูล:
-1. สื่อสารเป็น "ภาษาไทย" เสมอ (ทับศัพท์เทคนิคภาษาอังกฤษได้ เช่น Static Head, Minor Loss, System Curve)
-2. หากข้อมูลใดไม่ปรากฏในเอกสาร ให้ใส่ค่าเป็น null (ห้ามเดาตัวเลขเองเด็ดขาด) และให้ระบุชื่อข้อมูลที่ขาดลงใน `missing_critical_data`
-3. ข้อมูลขั้นต่ำที่จำเป็นต้องมีเพื่อคำนวณ System Curve คือ: อัตราการไหล (Q), Static Head (หรือระดับน้ำต้นทาง-ปลายทาง), ขนาดท่อ (Diameter/Area), และความยาวท่อ (Length) หากมีครบแล้ว ให้ `missing_critical_data` เป็น Array ว่าง `[]`
-4. แยกข้อมูลแนวท่อลงใน `pipe_segments` ให้ละเอียด:
-   - หากเป็นงานท่อทั่วไป ให้สร้าง 1 segment
-   - หากเป็นงานระบบอุโมงค์ซับซ้อน (เช่น มีอุโมงค์ดูด, ท่อไซฟอนในสถานี, อุโมงค์ระบาย) ให้แยกเป็นหลาย segment ตามจริง โดยรวมค่า k ของข้องอ/ทางเข้า/ทางออก ไว้ใน `minor_loss_k_sum` หรือถ้าระบุเป็นหน่วยเมตรมาแล้วให้ใส่ใน `fixed_minor_loss_m`
+กฎเหล็ก (Strict Gatekeeper Rules):
+1. ห้ามเดาหรือสมมติตัวเลขใดๆ ที่ไม่ได้เขียนไว้ในข้อมูลของผู้ใช้งานเด็ดขาด หากไม่มีให้ใส่ค่าเป็น null
+2. หากผู้ใช้งานระบุขนาดท่อ (เช่น Dia 5.0 m) ให้ใส่ค่าลงใน `main_pipe_diameter_m` ด้วยเสมอ
+3. ข้อมูลบังคับที่ต้องมีเพื่อคำนวณ System Curve ได้แก่:
+   - อัตราการไหล (Q)
+   - Static Head หรือระดับน้ำต้นทาง-ปลายทาง
+   - ขนาดท่อ (Diameter หรือ Area)
+   - ความยาวท่อ (Length > 0)
+   - ค่าความขรุขระ (Manning n หรือ Darcy f หรือชนิดวัสดุท่อ)
+   หากขาดข้อใดข้อหนึ่ง ให้ระบุรายการที่ขาดลงใน `missing_critical_data` เป็นภาษาไทยให้ครบถ้วน
 """
 
 # ==========================================
@@ -267,12 +306,12 @@ with col2:
     manual_input = st.text_area(
         "✍️ หรือกรอกข้อมูลสเปคปั๊มและระบบท่อด้วยตนเอง:",
         height=180,
-        placeholder="ตัวอย่าง: สูบน้ำรวม 60 m3/s (เดินขนาน 6 เครื่อง) ระดับน้ำดูด -3.00 m ระดับน้ำระบาย +2.50 m อุโมงค์ดูด Dia 5.0 m ยาว 8,435 m (n=0.014)..."
+        placeholder="พิมพ์รายละเอียดสเปคปั๊มและแนวท่อที่นี่..."
     )
 
 if st.button("🚀 สกัดข้อมูลและวิเคราะห์พารามิเตอร์ (Extract & Parse Data)", type="primary", use_container_width=True):
     if uploaded_files or camera_photo or manual_input:
-        with st.spinner("🤖 AI กำลังอ่านข้อมูลและจัดโครงสร้างพารามิเตอร์ชลศาสตร์..."):
+        with st.spinner("🤖 AI กำลังอ่านข้อมูลและตรวจสอบความครบถ้วนของพารามิเตอร์..."):
             text_content = manual_input
             image_base64_list = []
 
@@ -304,88 +343,123 @@ if st.button("🚀 สกัดข้อมูลและวิเคราะ�
             )
 
             tool_call = response.choices[0].message.tool_calls[0]
-            st.session_state['extracted_params'] = json.loads(tool_call.function.arguments)
+            extracted = json.loads(tool_call.function.arguments)
+
+            # หาก AI ใส่ขนาดท่อไว้ใน pipe_segments แต่ลืมใส่ที่ main_pipe_diameter_m ให้ดึงขึ้นมาแสดงบนการ์ดด้วย
+            if not extracted.get("main_pipe_diameter_m") and extracted.get("pipe_segments"):
+                first_d = extracted["pipe_segments"][0].get("diameter_m")
+                if first_d:
+                    extracted["main_pipe_diameter_m"] = first_d
+
+            st.session_state['extracted_params'] = extracted
     else:
         st.error("🚨 กรุณาอัปโหลดไฟล์, ถ่ายรูป, หรือพิมพ์ข้อความก่อนกดปุ่มวิเคราะห์ครับ")
 
 # ==========================================
-# แสดงผลข้อมูลที่ดึงได้ (แก้ไขหน่วยไม่ออกเมื่อไม่พบข้อมูลแล้ว)
+# แสดงผลการ์ดพารามิเตอร์ & ระบบล็อก GATEKEEPER
 # ==========================================
 if 'extracted_params' in st.session_state:
-    data = st.session_state['extracted_params']
+    raw_data = st.session_state['extracted_params']
     st.divider()
     st.markdown("### 📋 สรุปพารามิเตอร์ที่ระบบอ่านได้จากเอกสารและรูปภาพ")
 
-    # แถวที่ 1: Q, Static Head, Pump Head
     c1, c2, c3 = st.columns(3)
-    q_display = data.get('flow_rate_original_text') or format_metric(data.get('flow_rate_q_m3s'), "m³/s")
+    q_display = raw_data.get('flow_rate_original_text') or format_metric(raw_data.get('flow_rate_q_m3s'), "m³/s")
     c1.metric("อัตราการไหล (Q)", q_display)
-    c2.metric("ระยะยกน้ำ (Static Head)", format_metric(data.get('static_head_m'), "m"))
-    c3.metric("Head ปั๊มที่เสนอ", format_metric(data.get('proposed_pump_head_m'), "m"))
+    c2.metric("ระยะยกน้ำ (Static Head)", format_metric(raw_data.get('static_head_m'), "m"))
+    c3.metric("Head ปั๊มที่เสนอ", format_metric(raw_data.get('proposed_pump_head_m'), "m"))
 
-    # แถวที่ 2: Pipe Length, Diameter, Roughness
     c4, c5, c6 = st.columns(3)
-    c4.metric("ความยาวท่อหลัก (Pipe Length)", format_metric(data.get('main_pipe_length_m'), "m"))
-    c5.metric("ขนาดท่อหลัก (Pipe Diameter)", format_metric(data.get('main_pipe_diameter_m'), "m"))
-    c6.metric("วัสดุ/ความขรุขระ (Roughness)", format_metric(data.get('pipe_material_or_roughness'), ""))
+    c4.metric("ความยาวท่อหลัก (Pipe Length)", format_metric(raw_data.get('main_pipe_length_m'), "m"))
+    c5.metric("ขนาดท่อหลัก (Pipe Diameter)", format_metric(raw_data.get('main_pipe_diameter_m'), "m"))
+    c6.metric("วัสดุ/ความขรุขระ (Roughness)", format_metric(raw_data.get('pipe_material_or_roughness'), ""))
 
-    # แสดงรายการอุปกรณ์ Minor Loss
     with st.expander("🔧 ดูรายการอุปกรณ์ประกอบ (Minor Loss Fittings) และลักษณะระบบ", expanded=True):
-        st.write(f"**ลักษณะระบบ:** {format_metric(data.get('system_type'), '')} | **จำนวนปั๊มเดินขนาน:** {format_metric(data.get('num_parallel_pumps'), 'เครื่อง', 0)}")
-        fittings = data.get('minor_loss_fittings') or []
+        st.write(f"**ลักษณะระบบ:** {format_metric(raw_data.get('system_type'), '')} | **จำนวนปั๊มเดินขนาน:** {format_metric(raw_data.get('num_parallel_pumps'), 'เครื่อง', 0)}")
+        fittings = raw_data.get('minor_loss_fittings') or []
         if fittings:
             for item in fittings:
                 st.write(f"- {item}")
         else:
             st.write("- ไม่พบข้อมูลอุปกรณ์ประกอบ")
 
-    # ตรวจสอบ Gatekeeper
-    missing = data.get('missing_critical_data') or []
-    if missing:
-        st.warning("⚠️ **ข้อมูลสำคัญขาดหาย (Gatekeeper Alert):** ระบบต้องการข้อมูลเหล่านี้เพิ่มเติมเพื่อคำนวณ System Curve ให้สมบูรณ์")
-        for m in missing:
-            st.error(f"❌ {m}")
-        st.info("💡 *คุณสามารถป้อนค่าที่ขาดหายไปในส่วนที่ 2 ด้านล่างด้วยตนเอง เพื่อจำลองกราฟ System Curve ต่อได้ทันที*")
+    # ตรวจสอบความครบถ้วนด้วยฟังก์ชัน Gatekeeper
+    is_complete, missing_reasons = check_data_completeness(raw_data)
+
+    # สำเนาข้อมูลเพื่อป้องกันไม่ให้ Widget เขียนทับค่าดิบในการ์ดสรุปด้านบน
+    working_data = copy.deepcopy(raw_data)
+    allow_step_2 = False
+
+    if is_complete:
+        st.success("✅ **ข้อมูลครบถ้วนสมบูรณ์ (Gatekeeper Passed):** ระบบกำลังดำเนินการคำนวณ Head Loss และสร้าง System Curve ในส่วนที่ 2")
+        allow_step_2 = True
     else:
-        st.success("✅ **ข้อมูลครบถ้วน:** พร้อมคำนวณ Head Loss และสร้างสมการ System Curve ในส่วนที่ 2!")
+        st.warning("🛑 **ระงับการคำนวณชั่วคราว (Gatekeeper Alert):** ข้อมูลไม่เพียงพอสำหรับการคำนวณ Head Loss และสร้างสมการ System Curve")
+        for m in missing_reasons:
+            st.error(f"❌ ขาดข้อมูล: {m}")
+
+        st.markdown("---")
+        # สวิตช์ให้ผู้ใช้งานเลือกได้ว่าจะหยุดแค่นี้ หรือจะบังคับไปต่อเพื่อลองปรับแต่งตัวเลขเล่นเอง
+        force_proceed = st.toggle(
+            "🔓 **บังคับเข้าสู่โหมดจำลองข้อมูลเอง (Force Proceed / Sandbox Mode)** — *เปิดสวิตช์นี้หากต้องการสมมติตัวเลขที่ขาดหายไปเพื่อทดลองพล็อตกราฟ System Curve*",
+            value=False
+        )
+
+        if force_proceed:
+            st.info("🛠️ **โหมดจำลองพารามิเตอร์ (Sandbox Mode):** กรุณากรอกหรือปรับค่าพารามิเตอร์ด้านล่างเพื่อใช้จำลองกราฟ System Curve")
+            sb1, sb2, sb3 = st.columns(3)
+            with sb1:
+                sim_q = st.number_input("1. อัตราการไหลรวม Q (m³/s):", min_value=0.01, value=float(raw_data.get("flow_rate_q_m3s") or 60.0), step=1.0)
+                sim_hst = st.number_input("2. ระยะยกน้ำสถิต Static Head (m):", value=float(raw_data.get("static_head_m") if raw_data.get("static_head_m") is not None else 5.50), step=0.5)
+            with sb2:
+                sim_d = st.number_input("3. ขนาดเส้นผ่านศูนย์กลางท่อ D (m):", min_value=0.05, value=float(raw_data.get("main_pipe_diameter_m") or 5.0), step=0.1)
+                sim_l = st.number_input("4. ความยาวท่อ/อุโมงค์ L (m):", min_value=1.0, value=float(raw_data.get("main_pipe_length_m") or 8435.0), step=50.0)
+            with sb3:
+                sim_n = st.number_input("5. ค่าความขรุขระ Manning's n:", min_value=0.008, max_value=0.050, value=float(raw_data.get("manning_n") or 0.014), step=0.001, format="%.4f")
+                sim_k = st.number_input("6. ผลรวมสัมประสิทธิ์ Minor Loss (ΣK):", min_value=0.0, value=float(raw_data.get("total_minor_k") or 28.5), step=0.5)
+
+            # อัปเดตเฉพาะใน working_data สำหรับนำไปคำนวณในส่วนที่ 2
+            working_data["flow_rate_q_m3s"] = sim_q
+            working_data["static_head_m"] = sim_hst
+            working_data["main_pipe_diameter_m"] = sim_d
+            working_data["main_pipe_length_m"] = sim_l
+            working_data["manning_n"] = sim_n
+            working_data["total_minor_k"] = sim_k
+            working_data["pipe_segments"] = [{
+                "segment_name": "ท่อ/อุโมงค์จำลอง (Simulated Conduit)",
+                "carries_single_pump_flow": False,
+                "diameter_m": sim_d,
+                "length_m": sim_l,
+                "manning_n": sim_n,
+                "darcy_f": float(raw_data.get("darcy_f") or 0.015),
+                "minor_loss_k_sum": sim_k,
+                "fixed_minor_loss_m": 0.0
+            }]
+            allow_step_2 = True
 
     # ==========================================
-    # 5. ส่วนแสดงผล STEP 2: คำนวณ HEAD LOSS และสร้าง SYSTEM CURVE
+    # 5. ส่วนแสดงผล STEP 2: จะทำงานเฉพาะเมื่อข้อมูลครบ หรือเปิดโหมด Force Proceed เท่านั้น!
     # ==========================================
-    st.divider()
-    st.subheader("2️⃣ ส่วนที่ 2: คำนวณ Head Loss และสร้างสมการ System Curve (H = KQ² + Hst)")
+    if allow_step_2:
+        st.divider()
+        st.subheader("2️⃣ ส่วนที่ 2: คำนวณ Head Loss และสร้างสมการ System Curve (H = KQ² + Hst)")
 
-    # แถบตั้งค่าการคำนวณ (รองรับการปรับแก้ตัวเลขหน้างาน หรือเลือกสมการ Manning vs Darcy-Weisbach)
-    cfg1, cfg2, cfg3 = st.columns(3)
-    with cfg1:
-        formula_choice = st.selectbox(
-            "📐 เลือกสมการคำนวณ Major Loss:",
-            ["Manning's Equation (ตามเอกสาร/งานอุโมงค์)", "Darcy-Weisbach (งานท่อแรงดันมาตรฐาน)"]
-        )
-    with cfg2:
-        flow_unit_plot = st.selectbox(
-            "📊 หน่วยอัตราการไหลบนแกน X ของกราฟ:",
-            ["m³/s (ลูกบาศก์เมตรต่อวินาที)", "m³/h (ลูกบาศก์เมตรต่อชั่วโมง)"]
-        )
-    with cfg3:
-        # เปิดโอกาสให้แก้ไขค่า Static Head หรือเติมค่าที่ขาดได้ทันที
-        override_static = st.number_input(
-            "ระดับยกน้ำสถิต Hst (m) [ปรับแก้ได้]:",
-            value=float(data.get("static_head_m") or 5.50),
-            step=0.5
-        )
-        data["static_head_m"] = override_static
+        cfg1, cfg2 = st.columns(2)
+        with cfg1:
+            formula_choice = st.selectbox(
+                "📐 เลือกสมการคำนวณความเสียดทานท่อตรง (Major Loss):",
+                ["Manning's Equation (งานอุโมงค์/ท่อระบายน้ำ)", "Darcy-Weisbach (งานท่อแรงดันมาตรฐาน)"]
+            )
+        with cfg2:
+            flow_unit_plot = st.selectbox(
+                "📊 หน่วยอัตราการไหลบนแกน X ของกราฟ:",
+                ["m³/s (ลูกบาศก์เมตรต่อวินาที)", "m³/h (ลูกบาศก์เมตรต่อชั่วโมง)"]
+            )
 
-    # ตรวจสอบว่ามีค่า Q และขนาดท่อเพียงพอสำหรับรันสมการหรือไม่
-    can_calculate = (data.get("flow_rate_q_m3s") is not None) and (
-        bool(data.get("pipe_segments")) or (data.get("main_pipe_diameter_m") and data.get("main_pipe_length_m"))
-    )
-
-    if can_calculate:
         selected_method = "Darcy" if "Darcy" in formula_choice else "Manning"
-        calc_res = run_hydraulic_engine(data, formula_override=selected_method)
+        calc_res = run_hydraulic_engine(working_data, formula_override=selected_method)
 
-        # แสดงการ์ดสรุปผลการคำนวณ Head Loss
+        # การ์ดสรุปผลการคำนวณ Head Loss
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("ระยะยกน้ำสถิต (Hst)", f"{calc_res['h_static_m']:.2f} m")
         m2.metric("ความเสียดทานท่อตรง (Major Loss)", f"{calc_res['total_major_loss_m']:.3f} m")
@@ -407,11 +481,11 @@ if 'extracted_params' in st.session_state:
 
         st.info(f"🧮 **สมการ System Curve ของระบบ:**  `{eq_str}`   *(โดยที่ Dynamic Head Loss รวม = `{calc_res['total_dynamic_loss_m']:.3f} m` ที่ Q = `{q_design:,.1f}`)*")
 
-        # ตารางแยกรายละเอียด Major & Minor Loss และความเร็ว V ในแต่ละช่วง
+        # ตารางแจกแจงความเร็ว V และ Head Loss รายช่วง
         st.markdown("#### 📑 ตารางแจกแจงการคำนวณความเร็ว (V) และ Head Loss รายช่วง")
         st.dataframe(calc_res["breakdown_df"], use_container_width=True, hide_index=True)
 
-        # สร้างกราฟพาราโบลา System Curve (H = K*Q^2 + Hst)
+        # พล็อตกราฟพาราโบลา System Curve
         q_max_plot = q_design * 1.35 if q_design > 0 else 100.0
         q_vals = np.linspace(0, q_max_plot, 100)
         h_sys_vals = (k_display * (q_vals ** 2)) + calc_res["h_static_m"]
@@ -419,7 +493,6 @@ if 'extracted_params' in st.session_state:
 
         fig = go.Figure()
 
-        # เส้นที่ 1: System Curve รวม (H = KQ^2 + Hst)
         fig.add_trace(go.Scatter(
             x=q_vals, y=h_sys_vals,
             mode='lines',
@@ -427,7 +500,6 @@ if 'extracted_params' in st.session_state:
             line=dict(color='#00B4D8', width=4)
         ))
 
-        # เส้นที่ 2: เส้น Dynamic Head Loss ล้วนๆ (KQ^2)
         fig.add_trace(go.Scatter(
             x=q_vals, y=h_loss_only_vals,
             mode='lines',
@@ -435,7 +507,6 @@ if 'extracted_params' in st.session_state:
             line=dict(color='#F77F00', width=2, dash='dot')
         ))
 
-        # เส้นที่ 3: เส้นระดับ Static Head (Hst)
         fig.add_hline(
             y=calc_res["h_static_m"],
             line_dash="dash",
@@ -444,7 +515,6 @@ if 'extracted_params' in st.session_state:
             annotation_position="bottom right"
         )
 
-        # จุดที่ 4: จุดความต้องการของระบบที่อัตราการไหลออกแบบ (Design System Duty Point)
         fig.add_trace(go.Scatter(
             x=[q_design],
             y=[calc_res["total_system_head_m"]],
@@ -455,8 +525,7 @@ if 'extracted_params' in st.session_state:
             textposition="top left"
         ))
 
-        # จุดที่ 5: หากผู้รับจ้างเสนอค่า Head ของปั๊มมาแล้ว ให้พล็อตเทียบทันที
-        pump_h = data.get("proposed_pump_head_m")
+        pump_h = working_data.get("proposed_pump_head_m")
         if pump_h is not None:
             pump_h = float(pump_h)
             is_pass = pump_h >= calc_res["total_system_head_m"]
@@ -484,8 +553,4 @@ if 'extracted_params' in st.session_state:
         )
 
         st.plotly_chart(fig, use_container_width=True)
-
-        # เก็บผลลัพธ์ไว้ใช้ต่อใน Phase 3 (เปรียบเทียบกับกราฟ Pump Curve เต็มรูปแบบ)
         st.session_state['hydraulic_results'] = calc_res
-    else:
-        st.warning("⏳ กรุณาอัปโหลดหรือป้อนข้อมูลที่มี **อัตราการไหล (Q)**, **ขนาดท่อ (Diameter)** และ **ความยาวท่อ (Length)** ให้ครบถ้วน เพื่อให้ระบบคำนวณและพล็อตกราฟ System Curve ครับ")
